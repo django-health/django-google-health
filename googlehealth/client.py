@@ -28,16 +28,6 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
 import httpx
 
-
-def _rfc3339(dt: datetime) -> str:
-    """Serialize a datetime as RFC3339 with a literal ``Z`` suffix, the format
-    Google's API expects for ``Interval.startTime`` / ``endTime``."""
-    return (
-        dt.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
-        + "Z"
-    )
-
-
 from . import oauth
 from .constants import API_BASE_URL, API_VERSION
 
@@ -49,6 +39,15 @@ DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 1.0
+
+
+def _rfc3339(dt: datetime) -> str:
+    """Serialize a datetime as RFC3339 with a literal ``Z`` suffix, the format
+    Google's API expects for ``Interval.startTime`` / ``endTime``."""
+    return (
+        dt.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+        + "Z"
+    )
 
 
 class GoogleHealthAPIError(Exception):
