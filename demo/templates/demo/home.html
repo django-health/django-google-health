@@ -85,7 +85,7 @@
       <a class="button" href="/admin/healthdatamodel/record/">Browse records</a>
     </div>
     <div style="display:flex;align-items:center;gap:0.75rem;margin-top:1rem">
-      <a href="{% url 'googlehealth:connect' %}">Re-authorize</a>
+      <a class="button" href="{% url 'googlehealth:connect' %}">Re-authorize</a>
       <form action="{% url 'googlehealth:disconnect' %}" method="post" style="margin:0">
         {% csrf_token %}
         <button type="submit" style="background:#fff;color:#a00;border-color:#a00">Disconnect</button>
