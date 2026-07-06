@@ -11,6 +11,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "healthdatamodel",
     "googlehealth",
+    "demo",
 ]
 
 MIDDLEWARE = [

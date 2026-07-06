@@ -34,13 +34,15 @@
     </ul>
   {% endif %}
 
-  {% if connection %}
+  {% if connection and connection.status == 'active' %}
     <div class="row connected">
       <div>
         <strong>Google Health connected</strong><br />
         <small>
           Google user ID: <code>{{ connection.google_user_id }}</code><br />
           Status: {{ connection.status }} ·
+          Token: {% if connection.is_token_expired %}<strong style="color:#a00">expired</strong>{% else %}valid{% endif %}
+          (expires {{ connection.token_expires_at }}) ·
           Last sync: {{ connection.last_sync_at|default:"never" }}
         </small>
       </div>
@@ -65,6 +67,16 @@
         <button type="submit">Sync now</button>
       </form>
     </div>
+    {% if connection.is_token_expired %}
+    <div class="row disconnected">
+      <div>
+        <strong>Access token expired.</strong><br />
+        <small>A sync will try to refresh it; if the refresh token is also expired or
+          revoked (an <code>invalid_grant</code> on sync), re-authorize to mint a new one.</small>
+      </div>
+      <a class="button" href="{% url 'googlehealth:connect' %}">Re-authorize</a>
+    </div>
+    {% endif %}
     <div class="row">
       <div>
         <strong>{{ record_count }}</strong> record(s) ·
@@ -72,17 +84,25 @@
       </div>
       <a class="button" href="/admin/healthdatamodel/record/">Browse records</a>
     </div>
-    <form action="{% url 'googlehealth:disconnect' %}" method="post" style="margin-top:1rem">
-      {% csrf_token %}
-      <button type="submit" style="background:#fff;color:#a00;border-color:#a00">Disconnect</button>
-    </form>
+    <div style="display:flex;align-items:center;gap:0.75rem;margin-top:1rem">
+      <a href="{% url 'googlehealth:connect' %}">Re-authorize</a>
+      <form action="{% url 'googlehealth:disconnect' %}" method="post" style="margin:0">
+        {% csrf_token %}
+        <button type="submit" style="background:#fff;color:#a00;border-color:#a00">Disconnect</button>
+      </form>
+    </div>
   {% else %}
     <div class="row disconnected">
       <div>
-        <strong>Not connected to Google Health.</strong><br />
-        <small>You'll be sent to Google for consent, then back here.</small>
+        {% if connection %}
+          <strong>Google Health {{ connection.status }}.</strong><br />
+          <small>This connection can no longer sync. Re-authorize to resume.</small>
+        {% else %}
+          <strong>Not connected to Google Health.</strong><br />
+          <small>You'll be sent to Google for consent, then back here.</small>
+        {% endif %}
       </div>
-      <a class="button" href="{% url 'googlehealth:connect' %}">Connect Google Health</a>
+      <a class="button" href="{% url 'googlehealth:connect' %}">{% if connection %}Re-authorize{% else %}Connect Google Health{% endif %}</a>
     </div>
   {% endif %}
 </body>
