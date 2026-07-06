@@ -85,6 +85,18 @@ GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION = os.environ.get(
     "GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION", ""
 )
 
+# Scopes requested at connect time. The package default omits profile, but the
+# demo runs sync with compute_basal=True, which calls users.getProfile (for the
+# age/sex needed by the BMR calc) — that endpoint needs profile.readonly, so we
+# add it here. Without it, sync fails with
+# "HTTP 403: Request had insufficient authentication scopes".
+GOOGLE_HEALTH_DEFAULT_SCOPES = [
+    "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
+    "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
+    "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
+    "https://www.googleapis.com/auth/googlehealth.profile.readonly",
+]
+
 # Where googlehealth.views.callback / disconnect redirect to. Library default
 # is /admin/; for the demo we want the user-facing homepage.
 GOOGLE_HEALTH_CONNECT_SUCCESS_URL = "/"

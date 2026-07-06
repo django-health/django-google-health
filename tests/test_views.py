@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -102,3 +103,56 @@ def test_disconnect_noop_when_no_connection(client, customer):
     client.force_login(customer)
     response = client.post("/google-health/disconnect/")
     assert response.status_code == 302
+
+
+# --- demo home view: connection-state rendering ---------------------------
+
+
+@pytest.mark.urls("demo.urls")
+def test_home_active_connection_shows_sync(client, customer, connection):
+    """An active connection with a live token offers Sync now."""
+    client.force_login(customer)
+    body = client.get("/").content.decode()
+    assert "Sync now" in body
+    assert "valid" in body  # token status
+    assert "expired" not in body
+
+
+@pytest.mark.urls("demo.urls")
+def test_home_revoked_connection_hides_sync_and_offers_reauth(
+    client, customer, connection
+):
+    """After disconnect (status=revoked) there must be no Sync button — only re-auth.
+
+    Regression: the page used to branch on connection-exists, so a revoked
+    connection still rendered "Sync now".
+    """
+    connection.status = ConnectionStatus.REVOKED
+    connection.save(update_fields=["status"])
+
+    client.force_login(customer)
+    body = client.get("/").content.decode()
+    assert "Sync now" not in body
+    assert "Re-authorize" in body
+    assert "revoked" in body
+
+
+@pytest.mark.urls("demo.urls")
+def test_home_expired_token_warns_and_offers_reauth(client, customer, connection):
+    """An active connection with an expired access token surfaces the expiry
+    and offers re-authorization (status=active alone was misleading)."""
+    connection.token_expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    connection.save(update_fields=["token_expires_at"])
+
+    client.force_login(customer)
+    body = client.get("/").content.decode()
+    assert "expired" in body
+    assert "Re-authorize" in body
+
+
+@pytest.mark.urls("demo.urls")
+def test_home_no_connection_shows_connect(client, customer):
+    client.force_login(customer)
+    body = client.get("/").content.decode()
+    assert "Connect Google Health" in body
+    assert "Sync now" not in body
