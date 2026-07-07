@@ -8,7 +8,6 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 import respx
-import responses
 from healthdatamodel.models import Record, Workout, WorkoutMetadataEntry
 from healthdatamodel.query import SLEEP_TYPE, ActivityMetric, SleepValue
 from httpx import Response
@@ -537,18 +536,18 @@ def test_sync_user_respects_data_types_argument(connection):
 
 
 @respx.mock
-@responses.activate
 def test_sync_user_handles_expired_token(customer):
     """End-to-end: stale token → proactive refresh → ingest flow continues."""
-    responses.add(
-        responses.POST,
-        OAUTH_TOKEN_URL,
-        json={
-            "access_token": "ya29.fresh",
-            "expires_in": 3600,
-            "token_type": "Bearer",
-            "scope": SCOPE_ACTIVITY_AND_FITNESS_READONLY,
-        },
+    respx.post(OAUTH_TOKEN_URL).mock(
+        return_value=Response(
+            200,
+            json={
+                "access_token": "ya29.fresh",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "scope": SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+            },
+        )
     )
     conn = GoogleHealthConnection.objects.create(
         customer=customer,
