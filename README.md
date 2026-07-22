@@ -50,6 +50,15 @@ Google Health scopes are namespaced under `https://www.googleapis.com/auth/googl
 - `googlehealth.health_metrics_and_measurements.readonly` — heart rate, weight, body fat, SpO2
 - `googlehealth.sleep.readonly` — sleep stages and sessions
 - `googlehealth.location.readonly` — exercise GPS
+- `googlehealth.profile.readonly` — DOB and gender, used by `compute_basal_calories` for
+  a real Mifflin-St Jeor BMR instead of a median fallback
+
+`DEFAULT_SCOPES` (overridable via `GOOGLE_HEALTH_DEFAULT_SCOPES`) requests
+activity_and_fitness, health_metrics_and_measurements, profile, and sleep,
+all readonly. **Existing connections must disconnect and reconnect** to pick
+up a newly added scope — a stored refresh token doesn't gain scopes
+retroactively, so `get_profile` will keep 403ing for anyone who connected
+before this scope was added.
 
 ## Storage
 
@@ -91,6 +100,7 @@ specifics that matter for the demo:
 - Under **Data Access**, add the scopes you want. A good starter set:
   `googlehealth.activity_and_fitness.readonly`,
   `googlehealth.health_metrics_and_measurements.readonly`,
+  `googlehealth.profile.readonly`,
   `googlehealth.sleep.readonly`.
 
 **One real-world prerequisite:** the Google Health API serves data from a

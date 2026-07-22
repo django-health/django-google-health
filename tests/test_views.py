@@ -11,11 +11,22 @@ from googlehealth.constants import (
     API_VERSION,
     OAUTH_REVOKE_URL,
     OAUTH_TOKEN_URL,
+    SCOPE_PROFILE_READONLY,
+    SCOPE_SETTINGS_READONLY,
 )
 from googlehealth.models import ConnectionStatus, GoogleHealthConnection
-from googlehealth.views import SESSION_KEY
+from googlehealth.views import DEFAULT_SCOPES, SESSION_KEY
 
 pytestmark = pytest.mark.django_db
+
+
+def test_default_scopes_include_profile_but_not_settings():
+    """compute_basal_calories needs profile.readonly for real DOB/gender
+
+    (issue #3); nothing reads unit/timezone settings yet, so that scope
+    stays opt-in."""
+    assert SCOPE_PROFILE_READONLY in DEFAULT_SCOPES
+    assert SCOPE_SETTINGS_READONLY not in DEFAULT_SCOPES
 
 
 def test_connect_requires_login(client):

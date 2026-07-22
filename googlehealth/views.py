@@ -26,15 +26,21 @@ from .signals import notification_received
 from .constants import (
     SCOPE_ACTIVITY_AND_FITNESS_READONLY,
     SCOPE_HEALTH_METRICS_AND_MEASUREMENTS_READONLY,
+    SCOPE_PROFILE_READONLY,
     SCOPE_SLEEP_READONLY,
 )
 from .models import GoogleHealthConnection
 
 SESSION_KEY = "googlehealth_oauth_flow"
 
+# Profile readonly is included so compute_basal_calories can read real DOB +
+# gender for Mifflin-St Jeor instead of silently falling back to a median
+# lookup table (issue #3). Settings readonly is deliberately left out until
+# something actually reads unit/timezone prefs.
 DEFAULT_SCOPES: tuple[str, ...] = (
     SCOPE_ACTIVITY_AND_FITNESS_READONLY,
     SCOPE_HEALTH_METRICS_AND_MEASUREMENTS_READONLY,
+    SCOPE_PROFILE_READONLY,
     SCOPE_SLEEP_READONLY,
 )
 
