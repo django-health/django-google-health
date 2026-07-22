@@ -28,6 +28,7 @@ os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 import httpx  # noqa: E402
 from django.conf import settings  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 from google.oauth2.credentials import Credentials  # noqa: E402
 from google_auth_oauthlib.flow import Flow  # noqa: E402
 
@@ -208,11 +209,20 @@ def refresh_access_token(connection: GoogleHealthConnection) -> GoogleHealthConn
         raise OAuthError(
             f"token refresh returned HTTP {response.status_code}: {response.text}"
         )
-    payload = response.json()
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        # Intercepting proxies can also return 200 with an HTML block page.
+        raise OAuthError(
+            f"token refresh returned non-JSON body: {response.text[:200]!r}"
+        ) from exc
     if "access_token" not in payload:
         # Some intermediaries (corporate proxies) return 200 with an error body.
         raise OAuthError(f"token refresh returned no access token: {payload!r}")
-    tokens = GoogleTokens.model_validate(payload)
+    try:
+        tokens = GoogleTokens.model_validate(payload)
+    except ValidationError as exc:
+        raise OAuthError(f"token refresh returned malformed body: {payload!r}") from exc
     connection.access_token = tokens.access_token
     connection.token_expires_at = tokens.expires_at()
     update_fields = ["access_token", "token_expires_at"]

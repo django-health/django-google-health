@@ -200,6 +200,40 @@ def test_refresh_access_token_raises_on_error_body(connection):
 
 
 @respx.mock
+def test_refresh_access_token_raises_on_non_json_body(connection):
+    """A 200 with a non-JSON body (e.g. an intercepting proxy's HTML block page)
+    must raise OAuthError, not JSONDecodeError."""
+    respx.post(OAUTH_TOKEN_URL).mock(
+        return_value=Response(
+            200,
+            text="<html><body>Access denied by proxy</body></html>",
+            headers={"content-type": "text/html"},
+        )
+    )
+
+    with pytest.raises(oauth.OAuthError):
+        oauth.refresh_access_token(connection)
+
+    connection.refresh_from_db()
+    assert connection.access_token == "ya29.initial-access"  # untouched
+
+
+@respx.mock
+def test_refresh_access_token_raises_on_malformed_json_body(connection):
+    """A 200 that has an access_token but is otherwise malformed (missing
+    expires_in) must raise OAuthError, not pydantic ValidationError."""
+    respx.post(OAUTH_TOKEN_URL).mock(
+        return_value=Response(200, json={"access_token": "ya29.partial"})
+    )
+
+    with pytest.raises(oauth.OAuthError):
+        oauth.refresh_access_token(connection)
+
+    connection.refresh_from_db()
+    assert connection.access_token == "ya29.initial-access"  # untouched
+
+
+@respx.mock
 def test_ingest_tokens_stores_issuing_client_id(customer):
     tokens = GoogleTokens(
         access_token="ya29.x", expires_in=3600, refresh_token="1//y", scope=SCOPES[0]
