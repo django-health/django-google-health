@@ -3,7 +3,6 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 import respx
-import responses
 from httpx import Response
 
 from googlehealth.client import GoogleHealthAPIError, GoogleHealthClient
@@ -84,7 +83,6 @@ def test_iter_data_points_walks_pages(connection, no_sleep):
 
 
 @respx.mock
-@responses.activate
 def test_proactive_refresh_when_token_expired(customer, no_sleep):
     conn = GoogleHealthConnection.objects.create(
         customer=customer,
@@ -94,15 +92,16 @@ def test_proactive_refresh_when_token_expired(customer, no_sleep):
         token_expires_at=datetime.now(timezone.utc) - timedelta(minutes=5),
         scopes=[SCOPE_ACTIVITY_AND_FITNESS_READONLY],
     )
-    responses.add(
-        responses.POST,
-        OAUTH_TOKEN_URL,
-        json={
-            "access_token": "ya29.fresh",
-            "expires_in": 3600,
-            "token_type": "Bearer",
-            "scope": SCOPE_ACTIVITY_AND_FITNESS_READONLY,
-        },
+    respx.post(OAUTH_TOKEN_URL).mock(
+        return_value=Response(
+            200,
+            json={
+                "access_token": "ya29.fresh",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "scope": SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+            },
+        )
     )
     route = respx.get(IDENTITY_URL).mock(
         return_value=Response(200, json={"googleUserId": "g1"})
@@ -117,17 +116,17 @@ def test_proactive_refresh_when_token_expired(customer, no_sleep):
 
 
 @respx.mock
-@responses.activate
 def test_401_triggers_refresh_and_single_retry(connection, no_sleep):
-    responses.add(
-        responses.POST,
-        OAUTH_TOKEN_URL,
-        json={
-            "access_token": "ya29.fresh",
-            "expires_in": 3600,
-            "token_type": "Bearer",
-            "scope": SCOPE_ACTIVITY_AND_FITNESS_READONLY,
-        },
+    respx.post(OAUTH_TOKEN_URL).mock(
+        return_value=Response(
+            200,
+            json={
+                "access_token": "ya29.fresh",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "scope": SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+            },
+        )
     )
     respx.get(IDENTITY_URL).mock(
         side_effect=[
@@ -145,17 +144,17 @@ def test_401_triggers_refresh_and_single_retry(connection, no_sleep):
 
 
 @respx.mock
-@responses.activate
 def test_repeated_401_raises_after_one_refresh(connection, no_sleep):
-    responses.add(
-        responses.POST,
-        OAUTH_TOKEN_URL,
-        json={
-            "access_token": "ya29.fresh",
-            "expires_in": 3600,
-            "token_type": "Bearer",
-            "scope": SCOPE_ACTIVITY_AND_FITNESS_READONLY,
-        },
+    respx.post(OAUTH_TOKEN_URL).mock(
+        return_value=Response(
+            200,
+            json={
+                "access_token": "ya29.fresh",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "scope": SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+            },
+        )
     )
     respx.get(IDENTITY_URL).mock(
         return_value=Response(401, json={"error": {"message": "invalid_token"}})

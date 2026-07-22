@@ -23,6 +23,11 @@ class GoogleHealthConnection(models.Model):
         related_name="google_health_connection",
     )
     google_user_id = models.CharField(max_length=128, db_index=True)
+    # OAuth client that issued these tokens. Google binds refresh grants to the
+    # issuing client, so multi-client setups (e.g. iOS/Android public clients
+    # alongside the backend's web client) must refresh with this id. Empty means
+    # the default client (settings.GOOGLE_HEALTH_CLIENT_ID).
+    client_id = models.CharField(max_length=255, blank=True, default="")
     access_token = models.TextField()
     refresh_token = models.TextField()
     token_expires_at = models.DateTimeField()

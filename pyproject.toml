@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "django-google-health"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Django app for the Google Health API (successor to the Fitbit Web API), backed by django-healthdatamodel."
 readme = "README.md"
 authors = [

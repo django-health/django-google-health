@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 # Google lets users grant a subset of requested scopes; oauthlib treats that as an
@@ -28,7 +28,7 @@ os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 import httpx  # noqa: E402
 from django.conf import settings  # noqa: E402
-from google.auth.transport.requests import Request as GoogleAuthRequest  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 from google.oauth2.credentials import Credentials  # noqa: E402
 from google_auth_oauthlib.flow import Flow  # noqa: E402
 
@@ -127,12 +127,19 @@ def ingest_tokens(
     tokens: GoogleTokens | dict[str, Any],
     google_user_id: str | None = None,
     now: datetime | None = None,
+    client_id: str | None = None,
 ) -> GoogleHealthConnection:
     """Persist tokens onto a ``GoogleHealthConnection`` (create or update).
 
     This is the entry point for the "mobile app already did the OAuth dance and is
     shipping us the token dict" pattern. ``google_user_id`` is fetched via
     ``users.getIdentity`` if not provided.
+
+    ``client_id`` is the OAuth client that minted the tokens, when it differs
+    from ``settings.GOOGLE_HEALTH_CLIENT_ID`` (e.g. a platform-specific iOS or
+    Android public client). Google only honors refresh grants presented by the
+    issuing client, so it is stored per connection and used by
+    :func:`refresh_access_token`. Omit it for tokens from the default client.
     """
     parsed = (
         tokens
@@ -155,6 +162,7 @@ def ingest_tokens(
         customer=customer,
         defaults={
             "google_user_id": google_user_id,
+            "client_id": client_id or "",
             "access_token": parsed.access_token,
             "refresh_token": parsed.refresh_token or "",
             "token_expires_at": parsed.expires_at(now=now),
@@ -165,14 +173,64 @@ def ingest_tokens(
     return connection
 
 
+def _connection_client(connection: GoogleHealthConnection) -> tuple[str, str | None]:
+    """Resolve the (client_id, client_secret) pair for a connection's tokens.
+
+    A connection carrying its own ``client_id`` was minted by a platform
+    client (iOS/Android). Those are public clients: Google's token endpoint
+    accepts refresh grants from them with no secret, and sending the *web*
+    client's secret alongside a foreign client_id would be rejected — so the
+    secret is only attached for the default (settings) client.
+    """
+    client_id = connection.client_id or settings.GOOGLE_HEALTH_CLIENT_ID
+    if client_id == settings.GOOGLE_HEALTH_CLIENT_ID:
+        return client_id, settings.GOOGLE_HEALTH_CLIENT_SECRET
+    return client_id, None
+
+
 def refresh_access_token(connection: GoogleHealthConnection) -> GoogleHealthConnection:
-    """Refresh the connection's access token in place using its stored refresh token."""
-    creds = get_credentials(connection)
-    creds.refresh(GoogleAuthRequest())
-    connection.access_token = creds.token
-    if creds.expiry is not None:
-        connection.token_expires_at = creds.expiry.replace(tzinfo=timezone.utc)
-    connection.save(update_fields=["access_token", "token_expires_at"])
+    """Refresh the connection's access token in place using its stored refresh token.
+
+    Talks to the token endpoint directly (httpx) rather than via
+    ``google.oauth2.credentials.Credentials.refresh``: google-auth puts
+    ``client_secret`` in the request body unconditionally, which breaks
+    secretless refresh for connections minted by public (iOS/Android) clients.
+    """
+    client_id, client_secret = _connection_client(connection)
+    body = {
+        "grant_type": "refresh_token",
+        "refresh_token": connection.refresh_token,
+        "client_id": client_id,
+    }
+    if client_secret:
+        body["client_secret"] = client_secret
+    response = httpx.post(OAUTH_TOKEN_URL, data=body, timeout=10.0)
+    if response.status_code >= 400:
+        raise OAuthError(
+            f"token refresh returned HTTP {response.status_code}: {response.text}"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        # Intercepting proxies can also return 200 with an HTML block page.
+        raise OAuthError(
+            f"token refresh returned non-JSON body: {response.text[:200]!r}"
+        ) from exc
+    if "access_token" not in payload:
+        # Some intermediaries (corporate proxies) return 200 with an error body.
+        raise OAuthError(f"token refresh returned no access token: {payload!r}")
+    try:
+        tokens = GoogleTokens.model_validate(payload)
+    except ValidationError as exc:
+        raise OAuthError(f"token refresh returned malformed body: {payload!r}") from exc
+    connection.access_token = tokens.access_token
+    connection.token_expires_at = tokens.expires_at()
+    update_fields = ["access_token", "token_expires_at"]
+    if tokens.refresh_token:
+        # Google may rotate the refresh token; keep the newest one.
+        connection.refresh_token = tokens.refresh_token
+        update_fields.append("refresh_token")
+    connection.save(update_fields=update_fields)
     return connection
 
 
@@ -195,15 +253,17 @@ def revoke(connection: GoogleHealthConnection) -> None:
 def get_credentials(connection: GoogleHealthConnection) -> Credentials:
     """Build a ``google.oauth2.credentials.Credentials`` for use with google-auth.
 
-    The returned object knows how to refresh itself via ``creds.refresh(Request())``;
-    :func:`refresh_access_token` is the persistence-aware wrapper.
+    Prefer :func:`refresh_access_token` for refreshing: it persists the result
+    and, unlike ``creds.refresh(Request())``, handles connections minted by
+    public (secretless) platform clients correctly.
     """
+    client_id, client_secret = _connection_client(connection)
     return Credentials(
         token=connection.access_token,
         refresh_token=connection.refresh_token or None,
         token_uri=OAUTH_TOKEN_URL,
-        client_id=settings.GOOGLE_HEALTH_CLIENT_ID,
-        client_secret=settings.GOOGLE_HEALTH_CLIENT_SECRET,
+        client_id=client_id,
+        client_secret=client_secret,
         scopes=list(connection.scopes),
     )
 
