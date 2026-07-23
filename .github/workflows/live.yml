@@ -1,0 +1,66 @@
+name: Live integration tests
+
+# Runs the @pytest.mark.live tests against the real health.googleapis.com
+# nightly, to catch schema/auth drift that the mocked test suite can't see.
+#
+# Requires three repo secrets: GOOGLE_HEALTH_TEST_CLIENT_ID,
+# GOOGLE_HEALTH_TEST_CLIENT_SECRET, GOOGLE_HEALTH_TEST_REFRESH_TOKEN. On
+# forks (or before they're configured on this repo) the job checks for
+# their presence and exits neutrally instead of failing, since
+# `secrets.*` can't be referenced directly in a job-level `if:`.
+#
+# 2026-07-22 calibration note: while the Google Cloud OAuth consent screen
+# is in "testing" mode, Google expires refresh tokens after 7 days
+# regardless of use — the commonly-cited 6-month idle expiry only applies
+# once the consent screen is verified/published to production. Until this
+# app's consent screen is in production, GOOGLE_HEALTH_TEST_REFRESH_TOKEN
+# will need re-minting roughly weekly. A nightly failure with
+# `invalid_grant` most likely means the token expired, not that the code
+# broke — re-mint the token (see README "Enable the live integration
+# tests") before spending time debugging.
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  live-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required secrets are configured
+        id: secrets-check
+        env:
+          GOOGLE_HEALTH_TEST_CLIENT_ID: ${{ secrets.GOOGLE_HEALTH_TEST_CLIENT_ID }}
+          GOOGLE_HEALTH_TEST_CLIENT_SECRET: ${{ secrets.GOOGLE_HEALTH_TEST_CLIENT_SECRET }}
+          GOOGLE_HEALTH_TEST_REFRESH_TOKEN: ${{ secrets.GOOGLE_HEALTH_TEST_REFRESH_TOKEN }}
+        run: |
+          if [ -z "$GOOGLE_HEALTH_TEST_CLIENT_ID" ] || [ -z "$GOOGLE_HEALTH_TEST_CLIENT_SECRET" ] || [ -z "$GOOGLE_HEALTH_TEST_REFRESH_TOKEN" ]; then
+            echo "One or more GOOGLE_HEALTH_TEST_* secrets are unset (fork or not yet configured on this repo) — skipping live tests."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.secrets-check.outputs.skip == 'false'
+
+      - name: Install uv
+        if: steps.secrets-check.outputs.skip == 'false'
+        uses: astral-sh/setup-uv@v8.2.0
+
+      - name: Install Python
+        if: steps.secrets-check.outputs.skip == 'false'
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        if: steps.secrets-check.outputs.skip == 'false'
+        run: uv sync --python 3.13 --group dev
+
+      - name: Run live tests
+        if: steps.secrets-check.outputs.skip == 'false'
+        env:
+          GOOGLE_HEALTH_TEST_CLIENT_ID: ${{ secrets.GOOGLE_HEALTH_TEST_CLIENT_ID }}
+          GOOGLE_HEALTH_TEST_CLIENT_SECRET: ${{ secrets.GOOGLE_HEALTH_TEST_CLIENT_SECRET }}
+          GOOGLE_HEALTH_TEST_REFRESH_TOKEN: ${{ secrets.GOOGLE_HEALTH_TEST_REFRESH_TOKEN }}
+        run: uv run pytest -m live -v

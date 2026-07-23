@@ -145,10 +145,23 @@ export GOOGLE_HEALTH_TEST_REFRESH_TOKEN=$(sqlite3 db.sqlite3 \
 uv run pytest tests/ -v -m live
 ```
 
-The default `pytest` run still skips them. CI doesn't have these secrets, so
-they skip there too (see issue
-[#7](https://github.com/andyreagan/django-google-health/issues/7) for adding
-a gated live-CI job).
+The default `pytest` run still skips them.
+
+A separate scheduled workflow (`.github/workflows/live.yml`) runs these
+tests nightly against the real API, gated on three repo secrets of the
+same names: `GOOGLE_HEALTH_TEST_CLIENT_ID`, `GOOGLE_HEALTH_TEST_CLIENT_SECRET`,
+and `GOOGLE_HEALTH_TEST_REFRESH_TOKEN`. Until those secrets are configured
+on the repo (and on forks, where they're never available), the job checks
+for them and exits neutrally instead of failing.
+
+**Token-expiry caveat (as of 2026-07-22):** while the Google Cloud OAuth
+consent screen for this app is in "testing" mode, Google expires refresh
+tokens after 7 days regardless of use — the 6-month idle-expiry behavior
+people usually expect only kicks in once the consent screen is verified
+and published to production. Until then, `GOOGLE_HEALTH_TEST_REFRESH_TOKEN`
+needs re-minting roughly weekly (repeat the `sqlite3` command above after a
+fresh OAuth round-trip). If the nightly job starts failing with
+`invalid_grant`, re-mint the token before assuming the code regressed.
 
 ## Development
 
