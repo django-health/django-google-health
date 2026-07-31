@@ -1120,3 +1120,59 @@ def test_sync_user_oauth_error_still_aborts(customer):
             data_types=[DATA_TYPE_STEPS, DATA_TYPE_WEIGHT],
             compute_basal=False,
         )
+
+
+@respx.mock
+def test_sync_user_collect_records_returns_mapped_records(connection):
+    """collect_records=True surfaces the mapped RecordInputs on the result so
+    callers can compute derived stats from the in-memory payload instead of
+    reading the (very large) Record table back."""
+    respx.post(_rollup_url(DATA_TYPE_STEPS)).mock(
+        return_value=Response(
+            200,
+            json={
+                "rollupDataPoints": [
+                    {
+                        "startTime": "2026-05-01T00:00:00Z",
+                        "endTime": "2026-05-01T00:15:00Z",
+                        "steps": {"countSum": "120"},
+                    },
+                ],
+                "nextPageToken": "",
+            },
+        )
+    )
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_STEPS],
+        resolution_minutes=15,
+        compute_basal=False,
+        collect_records=True,
+    )
+
+    assert len(result.records) == 1
+    rec = result.records[0]
+    assert rec.type == str(ActivityMetric.STEPS)
+    assert rec.value == "120"
+    assert rec.startDate == datetime(2026, 5, 1, 0, 0, tzinfo=timezone.utc)
+
+
+@respx.mock
+def test_sync_user_records_empty_by_default(connection):
+    """Without collect_records, no in-memory payload is retained."""
+    respx.get(_dp_url(DATA_TYPE_HEART_RATE)).mock(
+        return_value=Response(200, json=_page([]))
+    )
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_HEART_RATE],
+        compute_basal=False,
+    )
+
+    assert result.records == []
