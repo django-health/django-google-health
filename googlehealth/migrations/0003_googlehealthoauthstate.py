@@ -6,29 +6,43 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('googlehealth', '0002_googlehealthconnection_client_id'),
+        ("googlehealth", "0002_googlehealthconnection_client_id"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
     operations = [
         migrations.CreateModel(
-            name='GoogleHealthOAuthState',
+            name="GoogleHealthOAuthState",
             fields=[
-                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('state', models.CharField(max_length=128, unique=True)),
-                ('code_verifier', models.CharField(max_length=256)),
-                ('scopes', models.JSONField(default=list)),
-                ('deeplink', models.CharField(max_length=512)),
-                ('created_at', models.DateTimeField(auto_now_add=True)),
-                ('expires_at', models.DateTimeField()),
-                ('consumed_at', models.DateTimeField(blank=True, null=True)),
-                ('customer', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='google_health_oauth_states', to=settings.AUTH_USER_MODEL)),
+                (
+                    "id",
+                    models.BigAutoField(
+                        auto_created=True,
+                        primary_key=True,
+                        serialize=False,
+                        verbose_name="ID",
+                    ),
+                ),
+                ("state", models.CharField(max_length=128, unique=True)),
+                ("code_verifier", models.CharField(max_length=256)),
+                ("scopes", models.JSONField(default=list)),
+                ("deeplink", models.CharField(max_length=512)),
+                ("created_at", models.DateTimeField(auto_now_add=True)),
+                ("expires_at", models.DateTimeField()),
+                ("consumed_at", models.DateTimeField(blank=True, null=True)),
+                (
+                    "customer",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="google_health_oauth_states",
+                        to=settings.AUTH_USER_MODEL,
+                    ),
+                ),
             ],
             options={
-                'verbose_name': 'Google Health OAuth state',
-                'verbose_name_plural': 'Google Health OAuth states',
+                "verbose_name": "Google Health OAuth state",
+                "verbose_name_plural": "Google Health OAuth states",
             },
         ),
     ]

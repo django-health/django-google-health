@@ -47,7 +47,9 @@ def _make_state(
         scopes=[SCOPE_SLEEP_READONLY],
         deeplink=deeplink,
         customer=customer,
-        expires_at=now - timedelta(minutes=1) if expired else now + timedelta(minutes=10),
+        expires_at=now - timedelta(minutes=1)
+        if expired
+        else now + timedelta(minutes=10),
         consumed_at=now if consumed else None,
     )
 
@@ -136,13 +138,17 @@ class TestStartMobileFlow:
 class TestMobileCallback:
     def test_access_denied_redirects_denied(self, customer):
         _make_state(customer)
-        resp = Client().get(CALLBACK_URL, {"error": "access_denied", "state": "teststate123"})
+        resp = Client().get(
+            CALLBACK_URL, {"error": "access_denied", "state": "teststate123"}
+        )
         assert resp.status_code == 302
         assert resp["Location"] == "demoapp://google-health?status=denied"
 
     def test_other_google_error_redirects_google_error(self, customer):
         _make_state(customer)
-        resp = Client().get(CALLBACK_URL, {"error": "server_error", "state": "teststate123"})
+        resp = Client().get(
+            CALLBACK_URL, {"error": "server_error", "state": "teststate123"}
+        )
         assert resp.status_code == 302
         assert "status=error" in resp["Location"]
         assert "reason=google_error" in resp["Location"]
@@ -169,7 +175,9 @@ class TestMobileCallback:
 
     def test_deeplink_from_state_row_used_in_redirect(self, customer):
         _make_state(customer, deeplink="androidapp://google-health")
-        resp = Client().get(CALLBACK_URL, {"error": "access_denied", "state": "teststate123"})
+        resp = Client().get(
+            CALLBACK_URL, {"error": "access_denied", "state": "teststate123"}
+        )
         assert resp["Location"].startswith("androidapp://")
 
     @patch("googlehealth.oauth._fetch_google_user_id", return_value="guser1")
@@ -188,7 +196,9 @@ class TestMobileCallback:
 
         mobile_connected.connect(_receiver)
         try:
-            resp = Client().get(CALLBACK_URL, {"code": "authcode", "state": "teststate123"})
+            resp = Client().get(
+                CALLBACK_URL, {"code": "authcode", "state": "teststate123"}
+            )
         finally:
             mobile_connected.disconnect(_receiver)
 
@@ -206,7 +216,9 @@ class TestMobileCallback:
         assert received[0]["connection"] == connection
 
         # State row is consumed — a replay of the same URL is state_invalid.
-        replay = Client().get(CALLBACK_URL, {"code": "authcode", "state": "teststate123"})
+        replay = Client().get(
+            CALLBACK_URL, {"code": "authcode", "state": "teststate123"}
+        )
         assert "reason=state_invalid" in replay["Location"]
 
         # exchange_code was called with the PKCE verifier + CSRF state pair.
@@ -216,7 +228,9 @@ class TestMobileCallback:
         assert kwargs["expected_state"] == "teststate123"
         assert kwargs["received_state"] == "teststate123"
 
-    @patch("googlehealth.oauth.exchange_code", side_effect=oauth.StateMismatchError("nope"))
+    @patch(
+        "googlehealth.oauth.exchange_code", side_effect=oauth.StateMismatchError("nope")
+    )
     def test_state_mismatch_redirects_state_invalid(self, _exc, customer):
         _make_state(customer)
         resp = Client().get(CALLBACK_URL, {"code": "abc", "state": "teststate123"})
@@ -243,7 +257,9 @@ class TestMobileCallback:
 
         mobile_connected.connect(_boom)
         try:
-            resp = Client().get(CALLBACK_URL, {"code": "authcode", "state": "teststate123"})
+            resp = Client().get(
+                CALLBACK_URL, {"code": "authcode", "state": "teststate123"}
+            )
         finally:
             mobile_connected.disconnect(_boom)
 
