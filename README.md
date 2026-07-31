@@ -42,6 +42,42 @@ GOOGLE_HEALTH_REDIRECT_URI = "https://your-app.example.com/google-health/callbac
 
 Set up the OAuth client in [Google Cloud Console](https://console.cloud.google.com/) and enable the Google Health API. See `docs/google-health/codelabs-make-your-first-api-call.md` for a step-by-step walkthrough.
 
+## Mobile (backend-owned) OAuth flow
+
+The session views (`connect`/`callback`) assume a logged-in browser. Mobile
+apps get a backend-owned flow instead — tokens are minted by your
+confidential web client (so they stay refreshable server-side), and no Django
+session is needed:
+
+1. Your **authenticated API endpoint** (DRF view, FastAPI route, …) calls
+   `googlehealth.oauth.start_mobile_flow(customer, deeplink="yourapp://google-health")`
+   and returns the consent URL to the app.
+2. The app opens the URL in a system browser
+   (ASWebAuthenticationSession / Chrome Custom Tab — don't follow it as a
+   redirect).
+3. Google redirects to the **public** `googlehealth.views.mobile_callback`
+   (`google-health/mobile/callback/`, URL name
+   `googlehealth:mobile_callback`) — the customer is resolved from a
+   single-use, TTL-bounded `GoogleHealthOAuthState` row, not a session.
+   Point `GOOGLE_HEALTH_REDIRECT_URI` (and the Google Cloud client's
+   authorized redirect URI) at wherever you serve it.
+4. The callback 302s the browser to the app's deep link:
+   `<deeplink>?status=success|denied|error[&reason=...]`.
+5. On success the `googlehealth.signals.mobile_connected` signal fires with
+   `customer` and `connection` — hook it to activate the data source, kick
+   off a first sync, etc.
+
+Related settings (all optional):
+
+```python
+GOOGLE_HEALTH_APP_DEEPLINK = "yourapp://google-health"  # default deep link; must be a non-http(s) app scheme
+GOOGLE_HEALTH_MOBILE_STATE_TTL_MINUTES = 10             # state row time-to-live
+GOOGLE_HEALTH_DEFAULT_SCOPES = [...]                    # shared with the session flow
+```
+
+The API endpoint and the callback can run in separate deployments (e.g. a
+Lambda API and a Kubernetes web tier) — they only need to share the database.
+
 ## Scopes
 
 Google Health scopes are namespaced under `https://www.googleapis.com/auth/googlehealth.*`. The complete list lives in `googlehealth.constants` and is documented in `docs/google-health/scopes.md`. Examples:
@@ -64,7 +100,7 @@ before this scope was added.
 
 This app does **not** define `Record` / `Workout` tables — those live in `django-healthdatamodel`. The `googlehealth.ingest` module maps Google Health API responses to `healthdatamodel.schemas.RecordInput` and `WorkoutInput`, then calls `healthdatamodel.ingest.ingest_records` to persist them. Read the data back with `healthdatamodel.query.*` (see that project's docs).
 
-The only model defined here is `GoogleHealthConnection`: per-user OAuth tokens, granted scopes, connection status, and last sync timestamp.
+The models defined here are `GoogleHealthConnection` (per-user OAuth tokens, granted scopes, connection status, and last sync timestamp) and `GoogleHealthOAuthState` (short-lived single-use state rows for the mobile flow).
 
 ## Documentation
 

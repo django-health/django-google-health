@@ -3,6 +3,9 @@
 Thin layer on top of ``google-auth-oauthlib``. The public API is:
 
 * :func:`build_authorization_url` — produce the consent URL for the web-callback flow.
+* :func:`start_mobile_flow` — produce the consent URL for the backend-owned mobile
+  flow, persisting the state → customer binding for the public
+  :func:`googlehealth.views.mobile_callback` to consume.
 * :func:`exchange_code` — server-side code → token exchange (with optional PKCE).
 * :func:`ingest_tokens` — persist tokens obtained externally (e.g. a mobile app that
   did the OAuth dance and POSTs the resulting token dict to your backend, mirroring
@@ -18,7 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 # Google lets users grant a subset of requested scopes; oauthlib treats that as an
@@ -28,6 +31,8 @@ os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 import httpx  # noqa: E402
 from django.conf import settings  # noqa: E402
+from django.core.exceptions import ImproperlyConfigured  # noqa: E402
+from django.utils import timezone  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
 from google.oauth2.credentials import Credentials  # noqa: E402
 from google_auth_oauthlib.flow import Flow  # noqa: E402
@@ -35,11 +40,16 @@ from google_auth_oauthlib.flow import Flow  # noqa: E402
 from .constants import (  # noqa: E402
     API_BASE_URL,
     API_VERSION,
+    DEFAULT_SCOPES,
     OAUTH_AUTHORIZATION_URL,
     OAUTH_REVOKE_URL,
     OAUTH_TOKEN_URL,
 )
-from .models import ConnectionStatus, GoogleHealthConnection  # noqa: E402
+from .models import (  # noqa: E402
+    ConnectionStatus,
+    GoogleHealthConnection,
+    GoogleHealthOAuthState,
+)
 from .schemas import GoogleTokens, OAuthFlowState  # noqa: E402
 
 if TYPE_CHECKING:
@@ -97,6 +107,71 @@ def build_authorization_url(
     return auth_url, OAuthFlowState(
         state=returned_state, code_verifier=code_verifier, scopes=scopes
     )
+
+
+DEFAULT_MOBILE_STATE_TTL_MINUTES = 10
+
+
+def start_mobile_flow(
+    customer: AbstractBaseUser,
+    *,
+    deeplink: str | None = None,
+    scopes: list[str] | None = None,
+    ttl_minutes: int | None = None,
+    prompt: str = "consent",
+) -> str:
+    """Begin the backend-owned mobile OAuth flow and return the consent URL.
+
+    Call this from an authenticated project-local API endpoint and hand the
+    returned URL to the mobile app, which opens it in a system browser
+    (ASWebAuthenticationSession / Chrome Custom Tab — do **not** follow it as
+    a redirect). Google then sends the user to the public
+    :func:`googlehealth.views.mobile_callback`, which resolves the customer
+    from the persisted state row and deep-links the result back to the app.
+
+    ``deeplink`` is where the callback 302s the finished user
+    (``<deeplink>?status=...``); defaults to
+    ``settings.GOOGLE_HEALTH_APP_DEEPLINK``. It must use a private app scheme —
+    http(s) values are rejected to keep the callback from becoming an open
+    redirect. ``scopes`` defaults to ``settings.GOOGLE_HEALTH_DEFAULT_SCOPES``
+    (falling back to :data:`googlehealth.constants.DEFAULT_SCOPES`);
+    ``ttl_minutes`` to ``settings.GOOGLE_HEALTH_MOBILE_STATE_TTL_MINUTES``
+    (falling back to 10).
+
+    Any still-pending state rows for ``customer`` are deleted first so a
+    retry or mid-flow abandonment doesn't leave orphan rows behind.
+    """
+    deeplink = deeplink or getattr(settings, "GOOGLE_HEALTH_APP_DEEPLINK", "")
+    if not deeplink:
+        raise ImproperlyConfigured(
+            "start_mobile_flow needs a deep link: pass deeplink= or set "
+            "settings.GOOGLE_HEALTH_APP_DEEPLINK"
+        )
+    if deeplink.lower().startswith(("http://", "https://")):
+        raise ValueError("deeplink must use a non-http(s) app scheme")
+    if scopes is None:
+        scopes = list(getattr(settings, "GOOGLE_HEALTH_DEFAULT_SCOPES", DEFAULT_SCOPES))
+    if ttl_minutes is None:
+        ttl_minutes = getattr(
+            settings,
+            "GOOGLE_HEALTH_MOBILE_STATE_TTL_MINUTES",
+            DEFAULT_MOBILE_STATE_TTL_MINUTES,
+        )
+
+    GoogleHealthOAuthState.objects.filter(
+        customer=customer, consumed_at__isnull=True
+    ).delete()
+
+    auth_url, flow_state = build_authorization_url(scopes=scopes, prompt=prompt)
+    GoogleHealthOAuthState.objects.create(
+        state=flow_state.state,
+        code_verifier=flow_state.code_verifier or "",
+        scopes=flow_state.scopes,
+        deeplink=deeplink,
+        customer=customer,
+        expires_at=timezone.now() + timedelta(minutes=ttl_minutes),
+    )
+    return auth_url
 
 
 def exchange_code(

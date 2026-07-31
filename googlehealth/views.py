@@ -1,9 +1,16 @@
 """HTTP views for OAuth + webhook notifications.
 
-The OAuth views (``connect`` / ``callback`` / ``disconnect``) cover the
-web-callback flow used in admin / dev / testing. Mobile clients should POST
-tokens (or an auth code) to a project-local endpoint that calls
-:func:`googlehealth.oauth.ingest_tokens` or :func:`googlehealth.oauth.exchange_code`.
+The session OAuth views (``connect`` / ``callback`` / ``disconnect``) cover
+the web-callback flow used in admin / dev / testing.
+
+``mobile_callback`` covers the backend-owned mobile flow: an authenticated
+project-local API endpoint calls :func:`googlehealth.oauth.start_mobile_flow`
+to mint the consent URL, the app opens it in a system browser, and Google
+redirects back here — anonymously, so identity is resolved from the stored
+:class:`googlehealth.models.GoogleHealthOAuthState` row instead of a session.
+The result is signalled to the app via a 302 to its deep link. (Mobile apps
+that already hold a token dict can instead POST it to a project-local
+endpoint that calls :func:`googlehealth.oauth.ingest_tokens`.)
 
 The ``notification_receiver`` view satisfies Google Health's webhook
 handshake and emits a :data:`googlehealth.signals.notification_received` signal
@@ -13,6 +20,7 @@ for every authenticated notification.
 from __future__ import annotations
 
 import json
+import logging
 
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
@@ -22,27 +30,13 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods, require_POST
 
 from . import oauth, webhooks
-from .signals import notification_received
-from .constants import (
-    SCOPE_ACTIVITY_AND_FITNESS_READONLY,
-    SCOPE_HEALTH_METRICS_AND_MEASUREMENTS_READONLY,
-    SCOPE_PROFILE_READONLY,
-    SCOPE_SLEEP_READONLY,
-)
-from .models import GoogleHealthConnection
+from .signals import mobile_connected, notification_received
+from .constants import DEFAULT_SCOPES  # noqa: F401 — re-exported (moved to constants)
+from .models import GoogleHealthConnection, consume
+
+log = logging.getLogger(__name__)
 
 SESSION_KEY = "googlehealth_oauth_flow"
-
-# Profile readonly is included so compute_basal_calories can read real DOB +
-# gender for Mifflin-St Jeor instead of silently falling back to a median
-# lookup table (issue #3). Settings readonly is deliberately left out until
-# something actually reads unit/timezone prefs.
-DEFAULT_SCOPES: tuple[str, ...] = (
-    SCOPE_ACTIVITY_AND_FITNESS_READONLY,
-    SCOPE_HEALTH_METRICS_AND_MEASUREMENTS_READONLY,
-    SCOPE_PROFILE_READONLY,
-    SCOPE_SLEEP_READONLY,
-)
 
 
 def _scopes() -> list[str]:
@@ -90,6 +84,97 @@ def callback(request: HttpRequest) -> HttpResponse:
 
     oauth.ingest_tokens(customer=request.user, tokens=tokens)
     return redirect(_success_url())
+
+
+def _app_redirect(deeplink: str, status: str, reason: str = "") -> HttpResponse:
+    """Build a 302 to the app deep-link with status and optional reason.
+
+    Uses HttpResponse directly rather than Django's redirect() shortcut because
+    redirect() rejects non-http(s) schemes with DisallowedRedirect.
+    """
+    url = f"{deeplink}?status={status}"
+    if reason:
+        url += f"&reason={reason}"
+    response = HttpResponse(status=302)
+    response["Location"] = url
+    return response
+
+
+@require_http_methods(["GET"])
+def mobile_callback(request: HttpRequest) -> HttpResponse:
+    """Public Google OAuth callback for the backend-owned mobile connect flow.
+
+    Google redirects here after the user approves or denies consent. The
+    browser session is anonymous (no login, no cookies), so the customer is
+    resolved by consuming the :class:`~googlehealth.models.GoogleHealthOAuthState`
+    row created by :func:`googlehealth.oauth.start_mobile_flow` — single-use
+    and TTL-bounded.
+
+    The outcome is reported to the app via a 302 to the deep link stored on
+    the state row:  ``<deeplink>?status=success|denied|error[&reason=...]``.
+    When the state can't be resolved (unknown / expired / replayed), the
+    redirect falls back to ``settings.GOOGLE_HEALTH_APP_DEEPLINK``; if that is
+    unset too, a plain 400 is returned.
+
+    On success, tokens are persisted via :func:`googlehealth.oauth.ingest_tokens`
+    and the :data:`googlehealth.signals.mobile_connected` signal fires so the
+    project can flip app-side state (activate the data source, kick off a
+    first sync, …). A receiver that raises sends ``status=error`` to the app.
+    """
+    code = request.GET.get("code")
+    received_state = request.GET.get("state")
+    error = request.GET.get("error")
+
+    # Consume the state early so rec.deeplink is available on all error paths.
+    # For unresolvable states we fall back to the server-side default.
+    rec = consume(received_state) if received_state else None
+    fallback = getattr(settings, "GOOGLE_HEALTH_APP_DEEPLINK", "")
+    deeplink = rec.deeplink if rec is not None else fallback
+    if not deeplink:
+        log.warning(
+            "mobile_callback: unresolvable state and no GOOGLE_HEALTH_APP_DEEPLINK"
+        )
+        return HttpResponseBadRequest("Unknown or expired OAuth state")
+
+    if error:
+        log.warning("mobile_callback received error from Google: %s", error)
+        if error == "access_denied":
+            return _app_redirect(deeplink, "denied")
+        return _app_redirect(deeplink, "error", "google_error")
+
+    if not code or not received_state:
+        log.warning("mobile_callback missing code or state params")
+        return _app_redirect(deeplink, "error", "state_invalid")
+
+    if rec is None:
+        log.warning(
+            "mobile_callback: state not found, expired, or already used: %s…",
+            received_state[:8],
+        )
+        return _app_redirect(deeplink, "error", "state_invalid")
+
+    try:
+        tokens = oauth.exchange_code(
+            code=code,
+            scopes=rec.scopes,
+            code_verifier=rec.code_verifier,
+            expected_state=rec.state,
+            received_state=received_state,
+        )
+        connection = oauth.ingest_tokens(customer=rec.customer, tokens=tokens)
+        mobile_connected.send(sender=None, customer=rec.customer, connection=connection)
+    except oauth.StateMismatchError:
+        log.error("mobile_callback: state mismatch for customer %s", rec.customer_id)
+        return _app_redirect(deeplink, "error", "state_invalid")
+    except Exception:
+        log.exception(
+            "mobile_callback: token exchange/ingest failed for customer %s",
+            rec.customer_id,
+        )
+        return _app_redirect(deeplink, "error", "exchange_failed")
+
+    log.info("Google Health connection established for customer %s", rec.customer_id)
+    return _app_redirect(deeplink, "success")
 
 
 @login_required
