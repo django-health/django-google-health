@@ -24,9 +24,11 @@ The high-level orchestrator is :func:`sync_user`.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import dateutil.parser
 from healthdatamodel.bmr import age_from_dob, calculate_bmr, get_bmr
@@ -54,9 +56,12 @@ from .constants import (
     DATA_TYPE_WEIGHT,
     SOURCE_NAME,
 )
+from .oauth import OAuthError
 
 if TYPE_CHECKING:
     from .models import GoogleHealthConnection
+
+logger = logging.getLogger(__name__)
 
 # Apple HealthKit identifiers not exported as enum members in healthdatamodel.
 HK_HEART_RATE = "HKQuantityTypeIdentifierHeartRate"
@@ -93,9 +98,15 @@ _SLEEP_STAGE_MAP: dict[str, str] = {
 
 @dataclass
 class SyncResult:
-    """Per-type counts returned by :func:`sync_user`."""
+    """Per-type counts (and per-type failures) returned by :func:`sync_user`.
+
+    ``errors`` maps a data type (or the basal-calories key) to a short
+    ``"ExceptionName: message"`` string when that part of the sync failed.
+    A type appears in ``counts`` or ``errors``, never both.
+    """
 
     counts: dict[str, int] = field(default_factory=dict)
+    errors: dict[str, str] = field(default_factory=dict)
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: datetime | None = None
 
@@ -587,43 +598,53 @@ def _civil(ts: datetime) -> str:
     )
 
 
-# Data types we fetch unfiltered — server rejects every filter syntax we've
-# tried. Empirically confirmed against a live account on 2026-05-15:
-#   * Sample types (heart-rate, weight, height, body-fat): no documented
-#     filter field; payload uses ``sampleTime``, not ``interval``.
-#   * Sleep (Session): filters on ``interval.civil_start_time`` / ``start_time``
-#     / ``civil_start_time`` all returned INVALID_DATA_POINT_FILTER_DATA_TYPE_MEMBER.
-#   * Daily aggregates (daily-resting-heart-rate, daily-oxygen-saturation): same.
-# Pagination + recency ordering bound the result for these.
-_UNFILTERABLE_DATA_TYPES = frozenset(
+# Server-side filter support per data-type family, verified empirically
+# against the live API on 2026-07-30 by probing candidate member names
+# (rejections return INVALID_DATA_POINT_FILTER_DATA_TYPE_MEMBER, so probing
+# is cheap and unambiguous):
+#   * Sample types filter on ``<key>.sample_time.civil_time``. The earlier
+#     2026-05-15 conclusion that samples were unfilterable only tried
+#     interval-style members — the ``sampleTime`` payload field was never
+#     attempted. Without this filter a sample fetch walks the account's
+#     ENTIRE history (observed: a heart-rate sync that never finished).
+#   * Daily aggregates filter on ``<key>.date`` (date-only literal).
+#   * Sleep (Session) rejects every member tried (``sample_time.*``,
+#     ``session.civil_start_time``, ``date``, ``civil_time``, ``interval.*``)
+#     — fetched unfiltered; pagination + recency ordering bound the result.
+_SAMPLE_TIME_FILTER_DATA_TYPES = frozenset(
     {
         DATA_TYPE_HEART_RATE,
         DATA_TYPE_WEIGHT,
         DATA_TYPE_BODY_FAT,
         DATA_TYPE_HEIGHT,
-        DATA_TYPE_SLEEP,
+    }
+)
+_DATE_FILTER_DATA_TYPES = frozenset(
+    {
         DATA_TYPE_DAILY_RESTING_HEART_RATE,
         DATA_TYPE_DAILY_OXYGEN_SATURATION,
     }
 )
+_UNFILTERABLE_DATA_TYPES = frozenset({DATA_TYPE_SLEEP})
 
 
 def _build_filter(data_type: str, start: datetime, end: datetime) -> str | None:
     """Return the ``filter`` query-string value for a given data type, or ``None``
     to fetch unfiltered.
 
-    Interval/Session/Daily types: one-sided ``<key>.interval.civil_start_time >=``
-    bound. Google's filter language rejects ``civil_end_time``/``end_time`` as
-    filterable fields (verified empirically against ``steps`` — combined AND
-    queries return ``INVALID_DATA_POINT_FILTER_DATA_TYPE_MEMBER``). Upper bound
-    is enforced client-side in ``sync_user``.
-
-    Sample types: no filter — REST docs don't specify a filter field for
-    samples, so we fetch and rely on pagination + recency ordering.
+    One-sided lower bound only: Google's filter language rejects
+    ``civil_end_time``/``end_time`` as filterable fields (verified against
+    ``steps``), so the upper bound is enforced client-side in ``sync_user``.
+    Member names per data-type family are verified empirically — see the
+    frozensets above. Only Sleep remains unfilterable.
     """
     if data_type in _UNFILTERABLE_DATA_TYPES:
         return None
     key = data_type.replace("-", "_")
+    if data_type in _SAMPLE_TIME_FILTER_DATA_TYPES:
+        return f'{key}.sample_time.civil_time >= "{_civil(start)}"'
+    if data_type in _DATE_FILTER_DATA_TYPES:
+        return f'{key}.date >= "{start.date().isoformat()}"'
     return f'{key}.interval.civil_start_time >= "{_civil(start)}"'
 
 
@@ -757,6 +778,97 @@ def compute_basal_calories(
     return len(records)
 
 
+def _totals_to_active_energy(
+    records: list[RecordInput], basal_rate: float
+) -> list[RecordInput]:
+    """Convert total-calories windows to active energy, in place.
+
+    Each window's pro-rata share of ``basal_rate`` (kcal/day) is subtracted
+    and the result floored at 0, matching Apple/HealthKit ActiveEnergyBurned
+    semantics (a fully sedentary window is 0 active kcal, not its BMR share).
+    """
+    for rec in records:
+        seconds = (rec.endDate - rec.startDate).total_seconds()
+        active = max(0.0, float(rec.value) - basal_rate * seconds / 86400.0)
+        rec.value = f"{active:.3f}"
+    return records
+
+
+def _sync_one_data_type(
+    connection: GoogleHealthConnection,
+    client: GoogleHealthClient,
+    data_type: str,
+    *,
+    start: datetime,
+    end: datetime,
+    resolution_minutes: int | None,
+    basal_rate: float | None,
+    result: SyncResult,
+) -> None:
+    """Fetch, map and ingest a single data type; updates ``result`` in place."""
+    use_rollup = (
+        resolution_minutes is not None
+        and data_type not in _ROLLUP_UNSUPPORTED_DATA_TYPES
+    )
+
+    if use_rollup:
+        window_seconds = resolution_minutes * 60
+        rollup_points = list(
+            client.iter_roll_up(
+                data_type,
+                start=start,
+                end=end,
+                window_seconds=window_seconds,
+            )
+        )
+        records = [
+            rec
+            for rec in (_rollup_to_record(data_type, p) for p in rollup_points)
+            if rec is not None
+        ]
+        if data_type == DATA_TYPE_TOTAL_CALORIES and basal_rate is not None:
+            records = _totals_to_active_energy(records, basal_rate)
+        ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
+        result.counts[data_type] = len(records)
+        return
+
+    filter_expr = _build_filter(data_type, start, end)
+    data_points = list(client.iter_data_points(data_type, filter=filter_expr))
+
+    if data_type == DATA_TYPE_EXERCISE:
+        workouts = [map_exercise(dp) for dp in data_points]
+        ingest_workouts(connection.customer, workouts, source=DataSource.GOOGLE_HEALTH)
+        result.counts[data_type] = len(workouts)
+        return
+
+    mapper = _RECORD_MAPPERS.get(data_type)
+    if mapper is None:
+        return
+    records: list[RecordInput] = []
+    skipped = 0
+    for dp in data_points:
+        try:
+            records.extend(mapper(dp))
+        except Exception as exc:  # noqa: BLE001 - one bad point must not abort the type
+            skipped += 1
+            logger.warning(
+                "googlehealth sync: skipping unmappable %s point for connection %s: %s: %s",
+                data_type,
+                connection.pk,
+                type(exc).__name__,
+                exc,
+            )
+    if skipped:
+        logger.warning(
+            "googlehealth sync: %s: skipped %d unmappable point(s) for connection %s",
+            data_type,
+            skipped,
+            connection.pk,
+        )
+    ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
+    result.counts[data_type] = len(records)
+
+
 def sync_user(
     connection: GoogleHealthConnection,
     *,
@@ -766,6 +878,7 @@ def sync_user(
     resolution_minutes: int | None = None,
     client: GoogleHealthClient | None = None,
     compute_basal: bool = True,
+    basal_rate: float | None = None,
 ) -> SyncResult:
     """Fetch + ingest all configured data types for ``connection`` over [start, end].
 
@@ -773,6 +886,25 @@ def sync_user(
     With ``compute_basal=True`` (default), runs :func:`compute_basal_calories`
     after the main ingest so a daily ``BASAL_CALORIES`` series is available
     for downstream MET calculations.
+
+    ``basal_rate`` (kcal/day): when set, ``total-calories`` rollup windows are
+    converted to ACTIVE energy before ingest — each window's pro-rata basal
+    share is subtracted and the result floored at 0. Rationale: the API's only
+    energy series is ``total-calories`` (all candidate active/basal type names
+    were probed and rejected on 2026-07-30), but the stored record type is
+    ``HKQuantityTypeIdentifierActiveEnergyBurned``, whose Apple/HealthKit
+    semantics — and the rewards engine's MET math built on them — require
+    basal-EXCLUDED energy. Left unset, raw totals are stored and a sedentary
+    interval scores MET≈2 downstream. Callers should pass their best estimate
+    of the customer's daily basal rate.
+
+    Failure isolation: one data type failing (bad filter, schema drift, a
+    transient error on one endpoint) does not abort the others — the failure
+    is recorded in ``SyncResult.errors`` and the sync continues. Credential
+    problems (:class:`OAuthError`) still abort the whole sync, since they
+    would fail every subsequent request anyway. ``compute_basal_calories`` is
+    likewise treated as an enrichment: its failure (e.g. a token minted
+    without the profile scope → HTTP 403) is recorded, not raised.
 
     ``resolution_minutes`` switches the ingest path:
 
@@ -806,61 +938,53 @@ def sync_user(
 
     try:
         for data_type in requested:
-            use_rollup = (
-                resolution_minutes is not None
-                and data_type not in _ROLLUP_UNSUPPORTED_DATA_TYPES
-            )
-
-            if use_rollup:
-                window_seconds = resolution_minutes * 60
-                rollup_points = list(
-                    client.iter_roll_up(
-                        data_type,
-                        start=start,
-                        end=end,
-                        window_seconds=window_seconds,
-                    )
+            try:
+                _sync_one_data_type(
+                    connection,
+                    client,
+                    data_type,
+                    start=start,
+                    end=end,
+                    resolution_minutes=resolution_minutes,
+                    basal_rate=basal_rate,
+                    result=result,
                 )
-                records = [
-                    rec
-                    for rec in (_rollup_to_record(data_type, p) for p in rollup_points)
-                    if rec is not None
-                ]
-                ingest_records(
-                    connection.customer, records, source=DataSource.GOOGLE_HEALTH
+            except OAuthError:
+                # A credential problem fails every subsequent request too —
+                # no point grinding through the remaining types.
+                raise
+            except Exception as exc:  # noqa: BLE001 - isolate per-type failures
+                logger.warning(
+                    "googlehealth sync: %s failed for connection %s: %s: %s",
+                    data_type,
+                    connection.pk,
+                    type(exc).__name__,
+                    exc,
                 )
-                result.counts[data_type] = len(records)
-                continue
-
-            filter_expr = _build_filter(data_type, start, end)
-            data_points = list(client.iter_data_points(data_type, filter=filter_expr))
-
-            if data_type == DATA_TYPE_EXERCISE:
-                workouts = [map_exercise(dp) for dp in data_points]
-                ingest_workouts(
-                    connection.customer, workouts, source=DataSource.GOOGLE_HEALTH
-                )
-                result.counts[data_type] = len(workouts)
-                continue
-
-            mapper = _RECORD_MAPPERS.get(data_type)
-            if mapper is None:
-                continue
-            records: list[RecordInput] = []
-            for dp in data_points:
-                records.extend(mapper(dp))
-            ingest_records(
-                connection.customer, records, source=DataSource.GOOGLE_HEALTH
-            )
-            result.counts[data_type] = len(records)
+                result.errors[data_type] = f"{type(exc).__name__}: {exc}"
 
         if compute_basal:
             # Computed AFTER the main loop so the latest weight/height records
             # this sync brought in are picked up by _latest_value_at_or_before.
-            basal_count = compute_basal_calories(
-                connection, start=start, end=end, client=client
-            )
-            result.counts[_BASAL_RESULT_KEY] = basal_count
+            # An enrichment, not a prerequisite: a failure here (e.g. a token
+            # minted without the profile scope → 403) must not discard an
+            # otherwise-complete sync.
+            try:
+                basal_count = compute_basal_calories(
+                    connection, start=start, end=end, client=client
+                )
+                result.counts[_BASAL_RESULT_KEY] = basal_count
+            except OAuthError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "googlehealth sync: compute_basal_calories failed for "
+                    "connection %s: %s: %s — continuing without basal",
+                    connection.pk,
+                    type(exc).__name__,
+                    exc,
+                )
+                result.errors[_BASAL_RESULT_KEY] = f"{type(exc).__name__}: {exc}"
     finally:
         if owns_client:
             client.close()

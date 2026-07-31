@@ -8,17 +8,17 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 import respx
+from healthdatamodel.constants import DataSource
 from healthdatamodel.models import Record, Workout, WorkoutMetadataEntry
 from healthdatamodel.query import SLEEP_TYPE, ActivityMetric, SleepValue
 from httpx import Response
 
 from googlehealth import ingest, oauth
 from googlehealth.client import GoogleHealthClient
-from healthdatamodel.constants import DataSource
-
 from googlehealth.constants import (
     API_BASE_URL,
     API_VERSION,
+    DATA_TYPE_DAILY_RESTING_HEART_RATE,
     DATA_TYPE_EXERCISE,
     DATA_TYPE_HEART_RATE,
     DATA_TYPE_SLEEP,
@@ -30,6 +30,7 @@ from googlehealth.constants import (
     SOURCE_NAME,
 )
 from googlehealth.models import GoogleHealthConnection
+from googlehealth.oauth import OAuthError
 
 
 def _dp_url(data_type: str) -> str:
@@ -651,9 +652,9 @@ def test_compute_basal_calories_falls_back_to_lookup_when_records_missing(connec
 
 @pytest.mark.django_db
 def test_compute_basal_calories_returns_default_when_profile_blank(connection):
+    from healthdatamodel.bmr import DEFAULT_BMR
     from healthdatamodel.models import Record
     from healthdatamodel.query import ActivityMetric
-    from healthdatamodel.bmr import DEFAULT_BMR
 
     count = ingest.compute_basal_calories(
         connection,
@@ -886,3 +887,236 @@ def test_sync_user_against_real_api(db):
     start = end - timedelta(hours=24)
     result = ingest.sync_user(conn, start=start, end=end, data_types=[DATA_TYPE_STEPS])
     assert DATA_TYPE_STEPS in result.counts
+
+
+# Server-side filters, failure isolation, active-energy conversion ------------
+# (all behaviors verified against the live API on 2026-07-30)
+
+
+@pytest.mark.parametrize(
+    ("data_type", "expected"),
+    [
+        (
+            DATA_TYPE_HEART_RATE,
+            'heart_rate.sample_time.civil_time >= "2026-05-01T00:00:00"',
+        ),
+        (DATA_TYPE_WEIGHT, 'weight.sample_time.civil_time >= "2026-05-01T00:00:00"'),
+        (
+            DATA_TYPE_DAILY_RESTING_HEART_RATE,
+            'daily_resting_heart_rate.date >= "2026-05-01"',
+        ),
+        (DATA_TYPE_STEPS, 'steps.interval.civil_start_time >= "2026-05-01T00:00:00"'),
+        (DATA_TYPE_SLEEP, None),
+    ],
+)
+def test_build_filter_member_per_data_type_family(data_type, expected):
+    """Samples filter on sample_time.civil_time, daily aggregates on date,
+    interval types on interval.civil_start_time; only Sleep is unfilterable.
+    An unfiltered sample fetch walks the account's ENTIRE history."""
+    start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 8, tzinfo=timezone.utc)
+    assert ingest._build_filter(data_type, start, end) == expected
+
+
+@respx.mock
+def test_sync_user_sends_sample_time_filter_for_heart_rate(connection):
+    route = respx.get(_dp_url(DATA_TYPE_HEART_RATE)).mock(
+        return_value=Response(200, json=_page([]))
+    )
+
+    ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_HEART_RATE],
+        compute_basal=False,
+    )
+
+    params = route.calls.last.request.url.params
+    assert (
+        params["filter"] == 'heart_rate.sample_time.civil_time >= "2026-05-01T00:00:00"'
+    )
+
+
+@respx.mock
+def test_sync_user_basal_rate_converts_total_calories_to_active(connection, customer):
+    """With basal_rate set, total-calories windows are stored as ACTIVE energy:
+    pro-rata basal subtracted, floored at 0 (Apple ActiveEnergyBurned semantics
+    — a sedentary window is 0 active kcal, not its BMR share)."""
+    respx.post(_rollup_url(DATA_TYPE_TOTAL_CALORIES)).mock(
+        return_value=Response(
+            200,
+            json={
+                "rollupDataPoints": [
+                    {
+                        "startTime": "2026-05-01T00:00:00Z",
+                        "endTime": "2026-05-01T00:15:00Z",
+                        "totalCalories": {"kcalSum": 25.0},
+                    },
+                    {
+                        "startTime": "2026-05-01T00:15:00Z",
+                        "endTime": "2026-05-01T00:30:00Z",
+                        "totalCalories": {"kcalSum": 5.0},
+                    },
+                ],
+                "nextPageToken": "",
+            },
+        )
+    )
+
+    ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_TOTAL_CALORIES],
+        resolution_minutes=15,
+        compute_basal=False,
+        basal_rate=960.0,  # 960 kcal/day -> exactly 10 kcal per 900s window
+    )
+
+    records = Record.objects.filter(
+        customer=customer, type=str(ActivityMetric.ACTIVE_CALORIES)
+    ).order_by("startDate")
+    assert [r.value for r in records] == ["15.000", "0.000"]
+
+
+@respx.mock
+def test_sync_user_without_basal_rate_keeps_raw_totals(connection, customer):
+    """Back-compat: no basal_rate -> totals stored unmodified."""
+    respx.post(_rollup_url(DATA_TYPE_TOTAL_CALORIES)).mock(
+        return_value=Response(
+            200,
+            json={
+                "rollupDataPoints": [
+                    {
+                        "startTime": "2026-05-01T00:00:00Z",
+                        "endTime": "2026-05-01T00:15:00Z",
+                        "totalCalories": {"kcalSum": 25.0},
+                    },
+                ],
+                "nextPageToken": "",
+            },
+        )
+    )
+
+    ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_TOTAL_CALORIES],
+        resolution_minutes=15,
+        compute_basal=False,
+    )
+
+    record = Record.objects.get(
+        customer=customer, type=str(ActivityMetric.ACTIVE_CALORIES)
+    )
+    assert record.value == "25.0"
+
+
+@respx.mock
+def test_sync_user_skips_unmappable_points(connection, customer):
+    """One malformed point must not abort the data type (previously a single
+    point missing its timestamp killed the whole customer sync)."""
+    good = {
+        "name": "users/me/dataTypes/heart-rate/dataPoints/ok",
+        "heartRate": {
+            "sampleTime": {"physicalTime": "2026-05-01T10:00:00Z"},
+            "beatsPerMinute": 62,
+        },
+    }
+    bad = {
+        "name": "users/me/dataTypes/heart-rate/dataPoints/broken",
+        "heartRate": {"beatsPerMinute": 60},  # no sampleTime/time -> mapper raises
+    }
+    respx.get(_dp_url(DATA_TYPE_HEART_RATE)).mock(
+        return_value=Response(200, json=_page([bad, good]))
+    )
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_HEART_RATE],
+        compute_basal=False,
+    )
+
+    assert result.counts[DATA_TYPE_HEART_RATE] == 1
+    record = Record.objects.get(customer=customer, type=ingest.HK_HEART_RATE)
+    assert record.value == "62"
+
+
+@respx.mock
+def test_sync_user_isolates_per_type_failures(connection, customer):
+    """One data type failing (bad filter, schema drift, non-retryable error)
+    is recorded in result.errors; the remaining types still sync."""
+    respx.get(_dp_url(DATA_TYPE_STEPS)).mock(
+        return_value=Response(400, json={"error": {"message": "boom"}})
+    )
+    respx.get(_dp_url(DATA_TYPE_WEIGHT)).mock(
+        return_value=Response(200, json=_page([]))
+    )
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_STEPS, DATA_TYPE_WEIGHT],
+        compute_basal=False,
+    )
+
+    assert DATA_TYPE_STEPS in result.errors
+    assert DATA_TYPE_STEPS not in result.counts
+    assert result.counts[DATA_TYPE_WEIGHT] == 0
+    # the sync completed and stamped the connection
+    connection.refresh_from_db()
+    assert connection.last_sync_at is not None
+
+
+@respx.mock
+def test_sync_user_compute_basal_failure_recorded_not_raised(connection, customer):
+    """compute_basal is an enrichment: a profile 403 (token minted without the
+    profile scope) must not discard an otherwise-complete sync."""
+    respx.get(_dp_url(DATA_TYPE_STEPS)).mock(return_value=Response(200, json=_page([])))
+    respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/profile").mock(
+        return_value=Response(403, json={"error": {"message": "insufficient scopes"}})
+    )
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_STEPS],
+        compute_basal=True,
+    )
+
+    assert result.counts[DATA_TYPE_STEPS] == 0
+    assert "basal-calories" in result.errors
+    connection.refresh_from_db()
+    assert connection.last_sync_at is not None
+
+
+@respx.mock
+def test_sync_user_oauth_error_still_aborts(customer):
+    """Credential failures affect every request — they must abort the sync,
+    not degrade into one errors[] entry per data type."""
+    respx.post(OAUTH_TOKEN_URL).mock(
+        return_value=Response(400, json={"error": "invalid_grant"})
+    )
+    conn = GoogleHealthConnection.objects.create(
+        customer=customer,
+        google_user_id="g-expired",
+        access_token="ya29.stale",
+        refresh_token="1//dead",
+        token_expires_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        scopes=[SCOPE_ACTIVITY_AND_FITNESS_READONLY],
+    )
+
+    with pytest.raises(OAuthError):
+        ingest.sync_user(
+            conn,
+            start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+            data_types=[DATA_TYPE_STEPS, DATA_TYPE_WEIGHT],
+            compute_basal=False,
+        )
