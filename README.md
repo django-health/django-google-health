@@ -70,9 +70,30 @@ session is needed:
 Related settings (all optional):
 
 ```python
-GOOGLE_HEALTH_APP_DEEPLINK = "yourapp://google-health"  # default deep link; must be a non-http(s) app scheme
+GOOGLE_HEALTH_APP_DEEPLINK = "yourapp://google-health"  # default deep link; must be an app-scheme absolute URI
+GOOGLE_HEALTH_ALLOWED_DEEPLINK_SCHEMES = ["yourapp"]    # restrict accepted schemes (default: any non-web scheme)
 GOOGLE_HEALTH_MOBILE_STATE_TTL_MINUTES = 10             # state row time-to-live
+GOOGLE_HEALTH_HTTP_TIMEOUT = 10.0                       # seconds, all outbound OAuth calls
 GOOGLE_HEALTH_DEFAULT_SCOPES = [...]                    # shared with the session flow
+```
+
+Deep links are validated by `oauth.validate_deeplink`: an absolute URI with a
+non-web scheme, no control characters, at most 512 chars. Web, `javascript:`
+and `data:` schemes and scheme-relative values (`//host`, which a browser
+resolves against the current scheme) are rejected — the value is emitted in a
+`Location` header, so it must not be able to point off your own host.
+
+Everything from the code exchange through your `mobile_connected` receivers runs
+in **one transaction**. If a receiver raises, the connection is rolled back and
+the app receives `status=error&reason=activation_failed`, so an error always
+means nothing was persisted. Receivers run synchronously on the user's redirect
+— keep them to DB work and queue anything network-bound.
+
+State rows are single-use and expire, but nothing deletes them on its own.
+Schedule the purge command alongside your other housekeeping:
+
+```
+python manage.py purge_google_health_oauth_states        # --keep-days N, --dry-run
 ```
 
 The API endpoint and the callback can run in separate deployments (e.g. a

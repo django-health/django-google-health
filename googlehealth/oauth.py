@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import secrets
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -64,6 +65,21 @@ class OAuthError(Exception):
 
 class StateMismatchError(OAuthError):
     """Raised when the ``state`` returned from Google doesn't match what we stashed."""
+
+
+DEFAULT_HTTP_TIMEOUT = 10.0
+
+
+def _http_timeout() -> float:
+    """Timeout (seconds) for every outbound OAuth call.
+
+    Override with ``settings.GOOGLE_HEALTH_HTTP_TIMEOUT``. This matters most on
+    the token exchange: it runs inside the public mobile callback, i.e. on a
+    request a user's browser is blocking on, and Google's token endpoint is
+    reachable through whatever corporate proxy sits in front of it (see
+    :func:`refresh_access_token`'s notes on middleboxes returning HTML).
+    """
+    return float(getattr(settings, "GOOGLE_HEALTH_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT))
 
 
 def _client_config() -> dict[str, dict[str, Any]]:
@@ -111,6 +127,56 @@ def build_authorization_url(
 
 DEFAULT_MOBILE_STATE_TTL_MINUTES = 10
 
+# Matches a private app scheme followed by ':' — RFC 3986 scheme grammar minus
+# the http(s) family. Anchored, so "//host" and "/path" (which browsers resolve
+# against the current origin, turning the callback's 302 into a redirect off the
+# host serving it) don't match.
+_APP_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]*:", re.IGNORECASE)
+_DISALLOWED_SCHEMES = frozenset(
+    {"http", "https", "javascript", "data", "file", "vbscript"}
+)
+# Storage cap; also the model field's max_length.
+MAX_DEEPLINK_LENGTH = 512
+
+
+def validate_deeplink(deeplink: str) -> str:
+    """Validate an app deep link for use in the callback's ``Location`` header.
+
+    The value ends up in a redirect header verbatim, so this is deliberately a
+    scheme *allowlist* (anything matching :data:`_APP_SCHEME_RE` and not in
+    :data:`_DISALLOWED_SCHEMES`) rather than a denylist of the bad prefixes —
+    a lexical "doesn't start with http://" check lets through ``//host``, which
+    a browser resolves as ``https://host``.
+
+    Projects can widen or narrow the accepted schemes with
+    ``settings.GOOGLE_HEALTH_ALLOWED_DEEPLINK_SCHEMES`` (a list of scheme names
+    without the colon); by default any non-web scheme is accepted.
+
+    Raises ``ValueError`` with a specific message for each rejection so the
+    caller can surface a useful client error.
+    """
+    if any(ch in deeplink for ch in "\r\n\x00"):
+        # Django would raise BadHeaderError later, from a code path outside the
+        # callback's try block — reject it at the door instead.
+        raise ValueError("deeplink must not contain control characters")
+    if len(deeplink) > MAX_DEEPLINK_LENGTH:
+        raise ValueError(f"deeplink must be at most {MAX_DEEPLINK_LENGTH} characters")
+    match = _APP_SCHEME_RE.match(deeplink)
+    if not match:
+        raise ValueError(
+            "deeplink must be an absolute URI with an app scheme, e.g. myapp://path"
+        )
+    scheme = match.group(0)[:-1].lower()
+    allowed = getattr(settings, "GOOGLE_HEALTH_ALLOWED_DEEPLINK_SCHEMES", None)
+    if allowed is not None:
+        if scheme not in {s.lower() for s in allowed}:
+            raise ValueError(
+                f"deeplink scheme {scheme!r} is not in GOOGLE_HEALTH_ALLOWED_DEEPLINK_SCHEMES"
+            )
+    elif scheme in _DISALLOWED_SCHEMES:
+        raise ValueError(f"deeplink must use a private app scheme, not {scheme!r}")
+    return deeplink
+
 
 def start_mobile_flow(
     customer: AbstractBaseUser,
@@ -131,9 +197,11 @@ def start_mobile_flow(
 
     ``deeplink`` is where the callback 302s the finished user
     (``<deeplink>?status=...``); defaults to
-    ``settings.GOOGLE_HEALTH_APP_DEEPLINK``. It must use a private app scheme —
-    http(s) values are rejected to keep the callback from becoming an open
-    redirect. ``scopes`` defaults to ``settings.GOOGLE_HEALTH_DEFAULT_SCOPES``
+    ``settings.GOOGLE_HEALTH_APP_DEEPLINK``. It must be an absolute URI with a
+    private app scheme — see :func:`validate_deeplink`, which rejects web
+    schemes, scheme-relative values, control characters and over-long input so
+    the callback can't be turned into a redirect off your own host.
+    ``scopes`` defaults to ``settings.GOOGLE_HEALTH_DEFAULT_SCOPES``
     (falling back to :data:`googlehealth.constants.DEFAULT_SCOPES`);
     ``ttl_minutes`` to ``settings.GOOGLE_HEALTH_MOBILE_STATE_TTL_MINUTES``
     (falling back to 10).
@@ -147,8 +215,7 @@ def start_mobile_flow(
             "start_mobile_flow needs a deep link: pass deeplink= or set "
             "settings.GOOGLE_HEALTH_APP_DEEPLINK"
         )
-    if deeplink.lower().startswith(("http://", "https://")):
-        raise ValueError("deeplink must use a non-http(s) app scheme")
+    validate_deeplink(deeplink)
     if scopes is None:
         scopes = list(getattr(settings, "GOOGLE_HEALTH_DEFAULT_SCOPES", DEFAULT_SCOPES))
     if ttl_minutes is None:
@@ -181,18 +248,26 @@ def exchange_code(
     code_verifier: str | None = None,
     expected_state: str | None = None,
     received_state: str | None = None,
+    timeout: float | None = None,
 ) -> GoogleTokens:
     """Exchange an authorization code for tokens.
 
     Pass ``expected_state`` and ``received_state`` to enforce CSRF protection at this
     layer; pass neither to skip (e.g. when the upstream view already validated).
+
+    ``timeout`` bounds the token-endpoint request (defaults to
+    ``settings.GOOGLE_HEALTH_HTTP_TIMEOUT``, else 10s). Without it
+    ``requests_oauthlib`` would block indefinitely, hanging the caller — which
+    for the mobile flow is a user-facing redirect.
     """
     if expected_state is not None and received_state != expected_state:
         raise StateMismatchError("OAuth state mismatch")
     flow = _build_flow(scopes, state=expected_state)
     if code_verifier is not None:
         flow.code_verifier = code_verifier
-    token_response = flow.fetch_token(code=code)
+    token_response = flow.fetch_token(
+        code=code, timeout=timeout if timeout is not None else _http_timeout()
+    )
     return GoogleTokens.model_validate(token_response)
 
 
@@ -279,7 +354,7 @@ def refresh_access_token(connection: GoogleHealthConnection) -> GoogleHealthConn
     }
     if client_secret:
         body["client_secret"] = client_secret
-    response = httpx.post(OAUTH_TOKEN_URL, data=body, timeout=10.0)
+    response = httpx.post(OAUTH_TOKEN_URL, data=body, timeout=_http_timeout())
     if response.status_code >= 400:
         raise OAuthError(
             f"token refresh returned HTTP {response.status_code}: {response.text}"
@@ -318,7 +393,7 @@ def revoke(connection: GoogleHealthConnection) -> None:
     token = connection.refresh_token or connection.access_token
     if token:
         try:
-            httpx.post(OAUTH_REVOKE_URL, data={"token": token}, timeout=10.0)
+            httpx.post(OAUTH_REVOKE_URL, data={"token": token}, timeout=_http_timeout())
         except httpx.HTTPError:
             pass
     connection.status = ConnectionStatus.REVOKED
@@ -348,7 +423,7 @@ def _fetch_google_user_id(access_token: str) -> str:
     response = httpx.get(
         f"{API_BASE_URL}/{API_VERSION}/users/me/identity",
         headers={"Authorization": f"Bearer {access_token}"},
-        timeout=10.0,
+        timeout=_http_timeout(),
     )
     if response.status_code >= 400:
         # raise_for_status drops the response body; we want it visible.

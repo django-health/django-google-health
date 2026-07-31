@@ -6,15 +6,19 @@ Covers the three pieces end-to-end at the unit level:
 * ``oauth.start_mobile_flow`` — consent-URL helper: state persistence,
   deep-link validation, defaults from settings, stale-row cleanup.
 * ``views.mobile_callback`` — the public callback: deep-link result codes,
-  state resolution, token ingest, and the ``mobile_connected`` signal.
+  state resolution, token ingest, transaction semantics, and the
+  ``mobile_connected`` signal.
+* ``purge_google_health_oauth_states`` — expired-row cleanup.
 """
 
 from datetime import timedelta
-from unittest.mock import patch
+from io import StringIO
+from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from django.core.exceptions import ImproperlyConfigured
+from django.core.management import call_command
 from django.test import Client, override_settings
 from django.utils import timezone
 
@@ -105,10 +109,47 @@ class TestStartMobileFlow:
         with pytest.raises(ImproperlyConfigured):
             oauth.start_mobile_flow(customer)
 
-    def test_http_deeplink_rejected(self, customer):
-        # Open-redirect guard: the callback 302s wherever the row points.
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "https://evil.example.com/",
+            "http://evil.example.com/",
+            # Scheme-relative: a browser resolves this against the current
+            # scheme, so the callback's 302 lands on evil.example.com.
+            "//evil.example.com/phish",
+            "/local/path",
+            "javascript:alert(1)//",
+            "data:text/html,<script>1</script>",
+            "app://x\r\nX-Injected: 1",
+            "app://x\nX-Injected: 1",
+            "app://" + "x" * 600,
+            "notascheme",
+        ],
+    )
+    def test_bad_deeplink_rejected(self, customer, bad):
+        # The stored value goes into a Location header verbatim, so validation
+        # is an allowlist of app schemes, not a denylist of http(s) prefixes.
         with pytest.raises(ValueError):
-            oauth.start_mobile_flow(customer, deeplink="https://evil.example.com/")
+            oauth.start_mobile_flow(customer, deeplink=bad)
+        assert not GoogleHealthOAuthState.objects.filter(customer=customer).exists()
+
+    @pytest.mark.parametrize(
+        "good",
+        [
+            "dswellrider://google-health",
+            "androidlivingwell://x/y?z=1",
+            "my-app.v2://cb",
+        ],
+    )
+    def test_app_scheme_deeplinks_accepted(self, customer, good):
+        oauth.start_mobile_flow(customer, deeplink=good)
+        assert GoogleHealthOAuthState.objects.get(customer=customer).deeplink == good
+
+    @override_settings(GOOGLE_HEALTH_ALLOWED_DEEPLINK_SCHEMES=["dswellrider"])
+    def test_scheme_allowlist_setting_narrows_accepted_schemes(self, customer):
+        oauth.start_mobile_flow(customer, deeplink="dswellrider://ok")
+        with pytest.raises(ValueError):
+            oauth.start_mobile_flow(customer, deeplink="someotherapp://nope")
 
     def test_default_scopes_include_profile_readonly(self, customer):
         # compute_basal_calories needs profile.readonly for a real BMR; a
@@ -244,9 +285,12 @@ class TestMobileCallback:
 
     @patch("googlehealth.oauth._fetch_google_user_id", return_value="guser1")
     @patch("googlehealth.oauth.exchange_code")
-    def test_raising_signal_receiver_redirects_exchange_failed(
+    def test_raising_receiver_rolls_back_connection_and_reports_activation_failed(
         self, mock_exchange, _fetch, customer
     ):
+        """A failed activation must leave nothing behind: an ACTIVE connection
+        with live tokens would be picked up by background sync for a user who
+        was told the connect failed."""
         mock_exchange.return_value = GoogleTokens(
             access_token="tok", expires_in=3600, refresh_token="ref", scope=""
         )
@@ -263,4 +307,120 @@ class TestMobileCallback:
         finally:
             mobile_connected.disconnect(_boom)
 
-        assert "reason=exchange_failed" in resp["Location"]
+        assert "status=error" in resp["Location"]
+        assert "reason=activation_failed" in resp["Location"]
+        assert not GoogleHealthConnection.objects.filter(customer=customer).exists()
+
+    @patch("googlehealth.oauth.ingest_tokens", side_effect=RuntimeError("db down"))
+    @patch("googlehealth.oauth.exchange_code")
+    def test_ingest_failure_reports_ingest_failed(
+        self, mock_exchange, _ingest, customer
+    ):
+        mock_exchange.return_value = GoogleTokens(
+            access_token="tok", expires_in=3600, refresh_token="ref", scope=""
+        )
+        _make_state(customer)
+        resp = Client().get(CALLBACK_URL, {"code": "abc", "state": "teststate123"})
+        assert "reason=ingest_failed" in resp["Location"]
+
+    @patch("googlehealth.oauth._fetch_google_user_id", return_value="guser1")
+    @patch("googlehealth.oauth.exchange_code")
+    def test_receiver_db_writes_roll_back_with_the_connection(
+        self, mock_exchange, _fetch, customer
+    ):
+        """Receivers run inside the callback's transaction, so their own writes
+        are undone too — the documented contract projects rely on."""
+        mock_exchange.return_value = GoogleTokens(
+            access_token="tok", expires_in=3600, refresh_token="ref", scope=""
+        )
+        _make_state(customer)
+
+        def _write_then_boom(sender, customer, connection, **kwargs):
+            connection.google_user_id = "written-by-receiver"
+            connection.save(update_fields=["google_user_id"])
+            raise RuntimeError("after write")
+
+        mobile_connected.connect(_write_then_boom)
+        try:
+            Client().get(CALLBACK_URL, {"code": "authcode", "state": "teststate123"})
+        finally:
+            mobile_connected.disconnect(_write_then_boom)
+
+        assert not GoogleHealthConnection.objects.filter(
+            google_user_id="written-by-receiver"
+        ).exists()
+
+    def test_invalid_stored_deeplink_is_rejected_before_any_oauth_work(self, customer):
+        """Rows predating deeplink validation must not 500 during header
+        composition after the tokens are already stored."""
+        rec = _make_state(customer)
+        GoogleHealthOAuthState.objects.filter(pk=rec.pk).update(
+            deeplink="//evil.example.com/phish"
+        )
+        resp = Client().get(CALLBACK_URL, {"code": "abc", "state": "teststate123"})
+        assert resp.status_code == 400
+        assert not GoogleHealthConnection.objects.filter(customer=customer).exists()
+
+
+class TestExchangeTimeout:
+    """The token exchange runs inside the browser-facing callback, so it must
+    not be able to block indefinitely (requests_oauthlib defaults to no
+    timeout)."""
+
+    def _flow(self):
+        flow = MagicMock()
+        flow.fetch_token.return_value = {
+            "access_token": "tok",
+            "expires_in": 3600,
+            "refresh_token": "ref",
+            "scope": "",
+        }
+        return flow
+
+    def test_default_timeout_passed_to_fetch_token(self, db):
+        flow = self._flow()
+        with patch("googlehealth.oauth._build_flow", return_value=flow):
+            oauth.exchange_code(code="abc", scopes=[])
+        assert (
+            flow.fetch_token.call_args.kwargs["timeout"] == oauth.DEFAULT_HTTP_TIMEOUT
+        )
+
+    @override_settings(GOOGLE_HEALTH_HTTP_TIMEOUT=3.5)
+    def test_timeout_from_settings(self, db):
+        flow = self._flow()
+        with patch("googlehealth.oauth._build_flow", return_value=flow):
+            oauth.exchange_code(code="abc", scopes=[])
+        assert flow.fetch_token.call_args.kwargs["timeout"] == 3.5
+
+    def test_explicit_timeout_wins(self, db):
+        flow = self._flow()
+        with patch("googlehealth.oauth._build_flow", return_value=flow):
+            oauth.exchange_code(code="abc", scopes=[], timeout=1.0)
+        assert flow.fetch_token.call_args.kwargs["timeout"] == 1.0
+
+
+class TestPurgeCommand:
+    def test_deletes_only_expired_rows(self, customer):
+        _make_state(customer, state="live")
+        _make_state(customer, state="stale", expired=True)
+        # A consumed-but-unexpired row is still within its window; leave it.
+        _make_state(customer, state="consumed_live", consumed=True)
+
+        out = StringIO()
+        call_command("purge_google_health_oauth_states", stdout=out)
+
+        remaining = set(GoogleHealthOAuthState.objects.values_list("state", flat=True))
+        assert remaining == {"live", "consumed_live"}
+        assert "Deleted 1" in out.getvalue()
+
+    def test_keep_days_retains_recently_expired(self, customer):
+        _make_state(customer, state="stale", expired=True)
+        call_command("purge_google_health_oauth_states", "--keep-days", "1")
+        assert GoogleHealthOAuthState.objects.filter(state="stale").exists()
+
+    def test_dry_run_reports_without_deleting(self, customer):
+        _make_state(customer, state="stale", expired=True)
+        out = StringIO()
+        call_command("purge_google_health_oauth_states", "--dry-run", stdout=out)
+        assert "1 expired state row(s) would be deleted" in out.getvalue()
+        assert GoogleHealthOAuthState.objects.filter(state="stale").exists()
