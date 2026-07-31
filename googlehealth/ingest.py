@@ -812,9 +812,13 @@ def _sync_one_data_type(
     resolution_minutes: int | None,
     basal_rate: float | None,
     result: SyncResult,
-    collect_records: bool = False,
-) -> None:
-    """Fetch, map and ingest a single data type; updates ``result`` in place."""
+) -> list[RecordInput]:
+    """Fetch, map and ingest a single data type.
+
+    Updates ``result.counts`` and returns the mapped records that were
+    ingested, so the caller decides what to retain. Workouts return ``[]``
+    (downstream stats don't consume them).
+    """
     use_rollup = (
         resolution_minutes is not None
         and data_type not in _ROLLUP_UNSUPPORTED_DATA_TYPES
@@ -839,9 +843,7 @@ def _sync_one_data_type(
             records = _totals_to_active_energy(records, basal_rate)
         ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
         result.counts[data_type] = len(records)
-        if collect_records:
-            _collect_window_records(result, records, start, end)
-        return
+        return records
 
     filter_expr = _build_filter(data_type, start, end)
     data_points = list(client.iter_data_points(data_type, filter=filter_expr))
@@ -850,11 +852,11 @@ def _sync_one_data_type(
         workouts = [map_exercise(dp) for dp in data_points]
         ingest_workouts(connection.customer, workouts, source=DataSource.GOOGLE_HEALTH)
         result.counts[data_type] = len(workouts)
-        return
+        return []
 
     mapper = _RECORD_MAPPERS.get(data_type)
     if mapper is None:
-        return
+        return []
     records: list[RecordInput] = []
     skipped = 0
     for dp in data_points:
@@ -878,14 +880,13 @@ def _sync_one_data_type(
         )
     ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
     result.counts[data_type] = len(records)
-    if collect_records:
-        _collect_window_records(result, records, start, end)
+    return records
 
 
-def _collect_window_records(
-    result: SyncResult, records: list[RecordInput], start: datetime, end: datetime
-) -> None:
-    """Retain only records overlapping [start, end] on the result.
+def _window_records(
+    records: list[RecordInput], start: datetime, end: datetime
+) -> list[RecordInput]:
+    """Return only the records overlapping [start, end].
 
     Bounds ``SyncResult.records`` to the sync window even when the underlying
     fetch is not (Sleep has no server-side filter, so its native fetch walks
@@ -894,9 +895,7 @@ def _collect_window_records(
     this is a cheap no-op filter for them; the hard ceiling it guarantees is
     one window's worth of records per data type.
     """
-    result.records.extend(
-        rec for rec in records if rec.endDate >= start and rec.startDate <= end
-    )
+    return [rec for rec in records if rec.endDate >= start and rec.startDate <= end]
 
 
 def sync_user(
@@ -976,7 +975,7 @@ def sync_user(
     try:
         for data_type in requested:
             try:
-                _sync_one_data_type(
+                type_records = _sync_one_data_type(
                     connection,
                     client,
                     data_type,
@@ -985,8 +984,9 @@ def sync_user(
                     resolution_minutes=resolution_minutes,
                     basal_rate=basal_rate,
                     result=result,
-                    collect_records=collect_records,
                 )
+                if collect_records:
+                    result.records.extend(_window_records(type_records, start, end))
             except OAuthError:
                 # A credential problem fails every subsequent request too —
                 # no point grinding through the remaining types.
