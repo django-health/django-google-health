@@ -103,10 +103,18 @@ class SyncResult:
     ``errors`` maps a data type (or the basal-calories key) to a short
     ``"ExceptionName: message"`` string when that part of the sync failed.
     A type appears in ``counts`` or ``errors``, never both.
+
+    ``records`` holds the mapped :class:`RecordInput` objects when the caller
+    passed ``collect_records=True`` — so points can be computed from the
+    in-memory payload instead of reading the (very large) Record table back.
+    Only records overlapping the sync window are retained (a hard ceiling of
+    one window's worth per data type, even for Sleep whose fetch is
+    unbounded), and workouts are not collected (not used by downstream stats).
     """
 
     counts: dict[str, int] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
+    records: list[RecordInput] = field(default_factory=list)
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: datetime | None = None
 
@@ -804,8 +812,13 @@ def _sync_one_data_type(
     resolution_minutes: int | None,
     basal_rate: float | None,
     result: SyncResult,
-) -> None:
-    """Fetch, map and ingest a single data type; updates ``result`` in place."""
+) -> list[RecordInput]:
+    """Fetch, map and ingest a single data type.
+
+    Updates ``result.counts`` and returns the mapped records that were
+    ingested, so the caller decides what to retain. Workouts return ``[]``
+    (downstream stats don't consume them).
+    """
     use_rollup = (
         resolution_minutes is not None
         and data_type not in _ROLLUP_UNSUPPORTED_DATA_TYPES
@@ -830,7 +843,7 @@ def _sync_one_data_type(
             records = _totals_to_active_energy(records, basal_rate)
         ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
         result.counts[data_type] = len(records)
-        return
+        return records
 
     filter_expr = _build_filter(data_type, start, end)
     data_points = list(client.iter_data_points(data_type, filter=filter_expr))
@@ -839,11 +852,11 @@ def _sync_one_data_type(
         workouts = [map_exercise(dp) for dp in data_points]
         ingest_workouts(connection.customer, workouts, source=DataSource.GOOGLE_HEALTH)
         result.counts[data_type] = len(workouts)
-        return
+        return []
 
     mapper = _RECORD_MAPPERS.get(data_type)
     if mapper is None:
-        return
+        return []
     records: list[RecordInput] = []
     skipped = 0
     for dp in data_points:
@@ -867,6 +880,22 @@ def _sync_one_data_type(
         )
     ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
     result.counts[data_type] = len(records)
+    return records
+
+
+def _window_records(
+    records: list[RecordInput], start: datetime, end: datetime
+) -> list[RecordInput]:
+    """Return only the records overlapping [start, end].
+
+    Bounds ``SyncResult.records`` to the sync window even when the underlying
+    fetch is not (Sleep has no server-side filter, so its native fetch walks
+    the account's entire history — potentially tens of thousands of stage
+    records for an old account). Rollup types are already window-bounded, so
+    this is a cheap no-op filter for them; the hard ceiling it guarantees is
+    one window's worth of records per data type.
+    """
+    return [rec for rec in records if rec.endDate >= start and rec.startDate <= end]
 
 
 def sync_user(
@@ -879,6 +908,7 @@ def sync_user(
     client: GoogleHealthClient | None = None,
     compute_basal: bool = True,
     basal_rate: float | None = None,
+    collect_records: bool = False,
 ) -> SyncResult:
     """Fetch + ingest all configured data types for ``connection`` over [start, end].
 
@@ -905,6 +935,12 @@ def sync_user(
     would fail every subsequent request anyway. ``compute_basal_calories`` is
     likewise treated as an enrichment: its failure (e.g. a token minted
     without the profile scope → HTTP 403) is recorded, not raised.
+
+    ``collect_records=True`` additionally returns the mapped Records on
+    ``SyncResult.records``, so callers can compute derived stats from the
+    in-memory payload instead of reading the Record table back (the table is
+    write-mostly by design; DB recompute is the backup path). Workouts are
+    not collected.
 
     ``resolution_minutes`` switches the ingest path:
 
@@ -939,7 +975,7 @@ def sync_user(
     try:
         for data_type in requested:
             try:
-                _sync_one_data_type(
+                type_records = _sync_one_data_type(
                     connection,
                     client,
                     data_type,
@@ -949,6 +985,8 @@ def sync_user(
                     basal_rate=basal_rate,
                     result=result,
                 )
+                if collect_records:
+                    result.records.extend(_window_records(type_records, start, end))
             except OAuthError:
                 # A credential problem fails every subsequent request too —
                 # no point grinding through the remaining types.
