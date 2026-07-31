@@ -50,3 +50,4 @@ USE_TZ = True
 GOOGLE_HEALTH_CLIENT_ID = "test-client-id"
 GOOGLE_HEALTH_CLIENT_SECRET = "test-client-secret"  # noqa: S105
 GOOGLE_HEALTH_REDIRECT_URI = "http://testserver/google-health/callback"
+GOOGLE_HEALTH_APP_DEEPLINK = "demoapp://google-health"
