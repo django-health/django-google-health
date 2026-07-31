@@ -1176,3 +1176,68 @@ def test_sync_user_records_empty_by_default(connection):
     )
 
     assert result.records == []
+
+
+@respx.mock
+def test_collect_records_is_window_bounded(connection, customer):
+    """Sleep's native fetch is unbounded (no server-side filter) — an old
+    account can return years of history. All of it is ingested, but only
+    records overlapping the sync window are retained on result.records, so
+    the in-memory payload has a hard ceiling."""
+    in_window = {
+        "name": "users/me/dataTypes/sleep/dataPoints/s-new",
+        "sleep": {
+            "interval": {
+                "startTime": "2026-05-01T03:00:00Z",
+                "endTime": "2026-05-01T07:00:00Z",
+            },
+            "stages": [
+                {
+                    "interval": {
+                        "startTime": "2026-05-01T03:00:00Z",
+                        "endTime": "2026-05-01T07:00:00Z",
+                    },
+                    "stage": "DEEP",
+                },
+            ],
+        },
+    }
+    ancient = {
+        "name": "users/me/dataTypes/sleep/dataPoints/s-old",
+        "sleep": {
+            "interval": {
+                "startTime": "2023-01-01T03:00:00Z",
+                "endTime": "2023-01-01T07:00:00Z",
+            },
+            "stages": [
+                {
+                    "interval": {
+                        "startTime": "2023-01-01T03:00:00Z",
+                        "endTime": "2023-01-01T07:00:00Z",
+                    },
+                    "stage": "DEEP",
+                },
+            ],
+        },
+    }
+    respx.get(_dp_url(DATA_TYPE_SLEEP)).mock(
+        return_value=Response(200, json=_page([ancient, in_window]))
+    )
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_SLEEP],
+        compute_basal=False,
+        collect_records=True,
+    )
+
+    # Both ingested (backup store keeps full history)...
+    assert result.counts[DATA_TYPE_SLEEP] == 2
+    assert Record.objects.filter(customer=customer, type=SLEEP_TYPE).count() == 2
+    # ...but only the in-window record is retained in memory.
+    assert len(result.records) == 1
+    assert result.records[0].startDate == datetime(
+        2026, 5, 1, 3, 0, tzinfo=timezone.utc
+    )

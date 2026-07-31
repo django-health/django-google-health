@@ -107,7 +107,9 @@ class SyncResult:
     ``records`` holds the mapped :class:`RecordInput` objects when the caller
     passed ``collect_records=True`` — so points can be computed from the
     in-memory payload instead of reading the (very large) Record table back.
-    Workouts are not collected (not used by downstream stats).
+    Only records overlapping the sync window are retained (a hard ceiling of
+    one window's worth per data type, even for Sleep whose fetch is
+    unbounded), and workouts are not collected (not used by downstream stats).
     """
 
     counts: dict[str, int] = field(default_factory=dict)
@@ -838,7 +840,7 @@ def _sync_one_data_type(
         ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
         result.counts[data_type] = len(records)
         if collect_records:
-            result.records.extend(records)
+            _collect_window_records(result, records, start, end)
         return
 
     filter_expr = _build_filter(data_type, start, end)
@@ -877,7 +879,24 @@ def _sync_one_data_type(
     ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
     result.counts[data_type] = len(records)
     if collect_records:
-        result.records.extend(records)
+        _collect_window_records(result, records, start, end)
+
+
+def _collect_window_records(
+    result: SyncResult, records: list[RecordInput], start: datetime, end: datetime
+) -> None:
+    """Retain only records overlapping [start, end] on the result.
+
+    Bounds ``SyncResult.records`` to the sync window even when the underlying
+    fetch is not (Sleep has no server-side filter, so its native fetch walks
+    the account's entire history — potentially tens of thousands of stage
+    records for an old account). Rollup types are already window-bounded, so
+    this is a cheap no-op filter for them; the hard ceiling it guarantees is
+    one window's worth of records per data type.
+    """
+    result.records.extend(
+        rec for rec in records if rec.endDate >= start and rec.startDate <= end
+    )
 
 
 def sync_user(
