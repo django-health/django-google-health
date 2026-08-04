@@ -23,8 +23,9 @@ so callers can cross-reference Google's docs without translation.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Iterator, Mapping
+from typing import TYPE_CHECKING, Any
 
 import httpx
 

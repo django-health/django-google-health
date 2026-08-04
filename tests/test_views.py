@@ -2,8 +2,8 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-import respx
 import responses
+import respx
 from httpx import Response
 
 from googlehealth.constants import (

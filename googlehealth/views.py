@@ -30,9 +30,9 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods, require_POST
 
 from . import oauth, webhooks
-from .signals import mobile_connected, notification_received
-from .constants import DEFAULT_SCOPES  # noqa: F401 — re-exported (moved to constants)
+from .constants import DEFAULT_SCOPES
 from .models import GoogleHealthConnection, consume
+from .signals import mobile_connected, notification_received
 
 log = logging.getLogger(__name__)
 

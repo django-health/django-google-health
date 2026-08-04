@@ -120,7 +120,7 @@ class Command(BaseCommand):
                     resolution_minutes=options["resolution_minutes"],
                     compute_basal=options["compute_basal"],
                 )
-            except Exception:  # noqa: BLE001 — log + continue is the contract
+            except Exception:
                 log.exception("sync_user failed for %s", label)
                 failures += 1
                 self.stderr.write(self.style.ERROR(f"  ✗ {label}: failed (see logs)"))
