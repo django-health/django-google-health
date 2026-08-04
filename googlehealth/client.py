@@ -33,6 +33,8 @@ from . import oauth
 from .constants import API_BASE_URL, API_VERSION
 
 if TYPE_CHECKING:
+    from typing import Self
+
     from .models import GoogleHealthConnection
 
 
@@ -85,7 +87,7 @@ class GoogleHealthClient:
 
     # context manager ------------------------------------------------------
 
-    def __enter__(self) -> GoogleHealthClient:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> None:

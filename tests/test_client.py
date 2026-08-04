@@ -160,9 +160,11 @@ def test_repeated_401_raises_after_one_refresh(connection, no_sleep):
         return_value=Response(401, json={"error": {"message": "invalid_token"}})
     )
 
-    with GoogleHealthClient(connection, sleep=no_sleep) as client:
-        with pytest.raises(GoogleHealthAPIError) as exc:
-            client.get_identity()
+    with (
+        GoogleHealthClient(connection, sleep=no_sleep) as client,
+        pytest.raises(GoogleHealthAPIError) as exc,
+    ):
+        client.get_identity()
 
     assert exc.value.status_code == 401
 
@@ -206,9 +208,11 @@ def test_non_retryable_4xx_raises_immediately_with_message(connection, no_sleep)
         return_value=Response(400, json={"error": {"message": "bad filter"}})
     )
 
-    with GoogleHealthClient(connection, sleep=no_sleep) as client:
-        with pytest.raises(GoogleHealthAPIError) as exc:
-            client.get_identity()
+    with (
+        GoogleHealthClient(connection, sleep=no_sleep) as client,
+        pytest.raises(GoogleHealthAPIError) as exc,
+    ):
+        client.get_identity()
 
     assert exc.value.status_code == 400
     assert "bad filter" in str(exc.value)
