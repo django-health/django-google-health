@@ -40,7 +40,9 @@ class Command(BaseCommand):
         queryset = GoogleHealthOAuthState.objects.filter(expires_at__lt=cutoff)
 
         if options["dry_run"]:
-            self.stdout.write(f"{queryset.count()} expired state row(s) would be deleted")
+            self.stdout.write(
+                f"{queryset.count()} expired state row(s) would be deleted"
+            )
             return
 
         deleted, _ = queryset.delete()
