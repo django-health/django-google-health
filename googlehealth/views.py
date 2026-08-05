@@ -24,6 +24,7 @@ import logging
 
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
+from django.db import transaction
 from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest
 from django.shortcuts import redirect
 from django.views.decorators.csrf import csrf_exempt
@@ -37,6 +38,18 @@ from .signals import mobile_connected, notification_received
 log = logging.getLogger(__name__)
 
 SESSION_KEY = "googlehealth_oauth_flow"
+
+
+class _MobileCallbackError(Exception):
+    """Internal: carries the ``reason`` code to report to the app.
+
+    Raised inside :func:`mobile_callback`'s transaction so the rollback and the
+    app-facing reason are decided in one place.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def _scopes() -> list[str]:
@@ -119,7 +132,18 @@ def mobile_callback(request: HttpRequest) -> HttpResponse:
     On success, tokens are persisted via :func:`googlehealth.oauth.ingest_tokens`
     and the :data:`googlehealth.signals.mobile_connected` signal fires so the
     project can flip app-side state (activate the data source, kick off a
-    first sync, …). A receiver that raises sends ``status=error`` to the app.
+    first sync, …).
+
+    Exchange, ingest and signal dispatch run in **one transaction**: a receiver
+    that raises rolls the connection back, so ``status=error`` to the app always
+    means "nothing was persisted". Without that, a failed activation would leave
+    an ACTIVE connection with live tokens that background sync jobs happily pick
+    up, for a user who was told the connect failed.
+
+    ``reason`` distinguishes the failure: ``state_invalid``, ``google_error``,
+    ``exchange_failed`` (Google rejected the code), ``ingest_failed`` (storing
+    the tokens failed), ``activation_failed`` (a ``mobile_connected`` receiver
+    raised).
     """
     code = request.GET.get("code")
     received_state = request.GET.get("state")
@@ -135,6 +159,16 @@ def mobile_callback(request: HttpRequest) -> HttpResponse:
             "mobile_callback: unresolvable state and no GOOGLE_HEALTH_APP_DEEPLINK"
         )
         return HttpResponseBadRequest("Unknown or expired OAuth state")
+
+    try:
+        # Rows written before deeplink validation existed — and the fallback
+        # setting, which never passed through start_mobile_flow — could contain
+        # a value that blows up header composition. Fail before doing any OAuth
+        # work rather than 500ing after the tokens are stored.
+        oauth.validate_deeplink(deeplink)
+    except ValueError:
+        log.error("mobile_callback: refusing to redirect to invalid deeplink")
+        return HttpResponseBadRequest("Invalid deep link configured for this flow")
 
     if error:
         log.warning("mobile_callback received error from Google: %s", error)
@@ -154,24 +188,41 @@ def mobile_callback(request: HttpRequest) -> HttpResponse:
         return _app_redirect(deeplink, "error", "state_invalid")
 
     try:
-        tokens = oauth.exchange_code(
-            code=code,
-            scopes=rec.scopes,
-            code_verifier=rec.code_verifier,
-            expected_state=rec.state,
-            received_state=received_state,
-        )
-        connection = oauth.ingest_tokens(customer=rec.customer, tokens=tokens)
-        mobile_connected.send(sender=None, customer=rec.customer, connection=connection)
+        # One transaction over exchange + ingest + receivers: on any failure
+        # below, the connection row must not survive (see docstring).
+        with transaction.atomic():
+            try:
+                tokens = oauth.exchange_code(
+                    code=code,
+                    scopes=rec.scopes,
+                    code_verifier=rec.code_verifier,
+                    expected_state=rec.state,
+                    received_state=received_state,
+                )
+            except oauth.StateMismatchError:
+                raise
+            except Exception as exc:
+                raise _MobileCallbackError("exchange_failed") from exc
+
+            try:
+                connection = oauth.ingest_tokens(customer=rec.customer, tokens=tokens)
+            except Exception as exc:
+                raise _MobileCallbackError("ingest_failed") from exc
+
+            try:
+                mobile_connected.send(
+                    sender=None, customer=rec.customer, connection=connection
+                )
+            except Exception as exc:
+                raise _MobileCallbackError("activation_failed") from exc
     except oauth.StateMismatchError:
         log.error("mobile_callback: state mismatch for customer %s", rec.customer_id)
         return _app_redirect(deeplink, "error", "state_invalid")
-    except Exception:
+    except _MobileCallbackError as exc:
         log.exception(
-            "mobile_callback: token exchange/ingest failed for customer %s",
-            rec.customer_id,
+            "mobile_callback: %s for customer %s", exc.reason, rec.customer_id
         )
-        return _app_redirect(deeplink, "error", "exchange_failed")
+        return _app_redirect(deeplink, "error", exc.reason)
 
     log.info("Google Health connection established for customer %s", rec.customer_id)
     return _app_redirect(deeplink, "success")

@@ -61,3 +61,6 @@ staticfiles/
 .vscode/
 *.swp
 .DS_Store
+
+# LLM coding tools
+sessions/
