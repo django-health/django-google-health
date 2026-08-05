@@ -662,7 +662,7 @@ def _build_filter(data_type: str, start: datetime, end: datetime) -> str | None:
 _BASAL_RESULT_KEY = "basal-calories"
 
 
-def _profile_dob_and_gender(profile: dict[str, Any]) -> tuple[datetime | None, str]:
+def _profile_dob_and_gender(profile: dict[str, Any]) -> tuple[date | None, str]:
     """Best-effort extraction of DOB + gender from Google Health profile payload.
 
     Google's profile schema isn't fully documented; we try the most common
@@ -674,18 +674,16 @@ def _profile_dob_and_gender(profile: dict[str, Any]) -> tuple[datetime | None, s
         or profile.get("birthday")
         or profile.get("birthDate")
     )
-    dob: datetime | None = None
+    dob: date | None = None
     if isinstance(dob_raw, str):
         try:
-            dob = dateutil.parser.parse(dob_raw)
+            dob = dateutil.parser.parse(dob_raw).date()
         except (ValueError, TypeError):
             dob = None
     elif isinstance(dob_raw, dict):
         # Google sometimes uses civil-date {"year": ..., "month": ..., "day": ...}.
         try:
-            dob = datetime(
-                int(dob_raw["year"]), int(dob_raw["month"]), int(dob_raw["day"])
-            )
+            dob = date(int(dob_raw["year"]), int(dob_raw["month"]), int(dob_raw["day"]))
         except (KeyError, TypeError, ValueError):
             dob = None
 
@@ -750,7 +748,7 @@ def compute_basal_calories(
                 client.close()
 
     dob, gender = _profile_dob_and_gender(profile or {})
-    age = age_from_dob(dob.date()) if dob is not None else None
+    age = age_from_dob(dob) if dob is not None else None
 
     customer = connection.customer
     creation = admin_create_date or datetime.now(timezone.utc)
@@ -965,12 +963,11 @@ def sync_user(
         client = GoogleHealthClient(connection)
 
     requested = list(data_types or DEFAULT_DATA_TYPES)
-    if resolution_minutes is not None:
-        # Expand the default set with rollup-only types when a resolution is set.
-        if data_types is None:
-            for dt in ROLLUP_ONLY_DATA_TYPES:
-                if dt not in requested:
-                    requested.append(dt)
+    # Expand the default set with rollup-only types when a resolution is set.
+    if resolution_minutes is not None and data_types is None:
+        for dt in ROLLUP_ONLY_DATA_TYPES:
+            if dt not in requested:
+                requested.append(dt)
 
     try:
         for data_type in requested:

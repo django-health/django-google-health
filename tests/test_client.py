@@ -160,9 +160,11 @@ def test_repeated_401_raises_after_one_refresh(connection, no_sleep):
         return_value=Response(401, json={"error": {"message": "invalid_token"}})
     )
 
-    with GoogleHealthClient(connection, sleep=no_sleep) as client:
-        with pytest.raises(GoogleHealthAPIError) as exc:
-            client.get_identity()
+    with (
+        GoogleHealthClient(connection, sleep=no_sleep) as client,
+        pytest.raises(GoogleHealthAPIError) as exc,
+    ):
+        client.get_identity()
 
     assert exc.value.status_code == 401
 
@@ -188,11 +190,13 @@ def test_5xx_retries_with_exponential_backoff_then_fails(connection):
     sleeps: list[float] = []
     respx.get(IDENTITY_URL).mock(return_value=Response(503, json={}))
 
-    with GoogleHealthClient(
-        connection, sleep=sleeps.append, max_retries=3, backoff_seconds=0.5
-    ) as client:
-        with pytest.raises(GoogleHealthAPIError) as exc:
-            client.get_identity()
+    with (
+        GoogleHealthClient(
+            connection, sleep=sleeps.append, max_retries=3, backoff_seconds=0.5
+        ) as client,
+        pytest.raises(GoogleHealthAPIError) as exc,
+    ):
+        client.get_identity()
 
     assert exc.value.status_code == 503
     assert sleeps == [0.5, 1.0, 2.0]  # base * 2^attempt for attempts 0,1,2
@@ -204,9 +208,11 @@ def test_non_retryable_4xx_raises_immediately_with_message(connection, no_sleep)
         return_value=Response(400, json={"error": {"message": "bad filter"}})
     )
 
-    with GoogleHealthClient(connection, sleep=no_sleep) as client:
-        with pytest.raises(GoogleHealthAPIError) as exc:
-            client.get_identity()
+    with (
+        GoogleHealthClient(connection, sleep=no_sleep) as client,
+        pytest.raises(GoogleHealthAPIError) as exc,
+    ):
+        client.get_identity()
 
     assert exc.value.status_code == 400
     assert "bad filter" in str(exc.value)

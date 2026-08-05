@@ -1,6 +1,6 @@
 """Minimal Django settings for pytest-django."""
 
-SECRET_KEY = "test-secret-key"  # noqa: S105
+SECRET_KEY = "test-secret-key"
 DEBUG = False
 
 INSTALLED_APPS = [
@@ -48,6 +48,6 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 USE_TZ = True
 
 GOOGLE_HEALTH_CLIENT_ID = "test-client-id"
-GOOGLE_HEALTH_CLIENT_SECRET = "test-client-secret"  # noqa: S105
+GOOGLE_HEALTH_CLIENT_SECRET = "test-client-secret"
 GOOGLE_HEALTH_REDIRECT_URI = "http://testserver/google-health/callback"
 GOOGLE_HEALTH_APP_DEEPLINK = "demoapp://google-health"

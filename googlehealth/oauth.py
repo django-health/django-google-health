@@ -29,15 +29,15 @@ from typing import TYPE_CHECKING, Any
 # google-auth-oauthlib below).
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
-import httpx  # noqa: E402
-from django.conf import settings  # noqa: E402
-from django.core.exceptions import ImproperlyConfigured  # noqa: E402
-from django.utils import timezone  # noqa: E402
-from pydantic import ValidationError  # noqa: E402
-from google.oauth2.credentials import Credentials  # noqa: E402
-from google_auth_oauthlib.flow import Flow  # noqa: E402
+import httpx
+from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
+from django.utils import timezone
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from pydantic import ValidationError
 
-from .constants import (  # noqa: E402
+from .constants import (
     API_BASE_URL,
     API_VERSION,
     DEFAULT_SCOPES,
@@ -45,12 +45,12 @@ from .constants import (  # noqa: E402
     OAUTH_REVOKE_URL,
     OAUTH_TOKEN_URL,
 )
-from .models import (  # noqa: E402
+from .models import (
     ConnectionStatus,
     GoogleHealthConnection,
     GoogleHealthOAuthState,
 )
-from .schemas import GoogleTokens, OAuthFlowState  # noqa: E402
+from .schemas import GoogleTokens, OAuthFlowState
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser

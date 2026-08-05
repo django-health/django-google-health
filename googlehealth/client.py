@@ -23,8 +23,9 @@ so callers can cross-reference Google's docs without translation.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Iterator, Mapping
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -32,6 +33,8 @@ from . import oauth
 from .constants import API_BASE_URL, API_VERSION
 
 if TYPE_CHECKING:
+    from typing import Self
+
     from .models import GoogleHealthConnection
 
 
@@ -84,7 +87,7 @@ class GoogleHealthClient:
 
     # context manager ------------------------------------------------------
 
-    def __enter__(self) -> GoogleHealthClient:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> None:

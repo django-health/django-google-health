@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "django-google-health"
-version = "0.6.0"
+version = "0.6.1"
 description = "A Django app for the Google Health API (successor to the Fitbit Web API), backed by django-healthdatamodel."
 readme = "README.md"
 authors = [
@@ -63,3 +63,6 @@ asyncio_mode = "auto"
 markers = [
     "live: requires real Google OAuth credentials in env (GOOGLE_HEALTH_TEST_*)",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"*/migrations/*" = ["RUF012"]
