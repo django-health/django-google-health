@@ -1,0 +1,19 @@
+{
+  "dataSource": {
+    "recordingMethod": "PASSIVELY_MEASURED",
+    "device": {
+      "displayName": "Charge 5"
+    },
+    "platform": "FITBIT"
+  },
+  "dailyOxygenSaturation": {
+    "date": {
+      "year": 2026,
+      "month": 8,
+      "day": 6
+    },
+    "averagePercentage": 99.3,
+    "lowerBoundPercentage": 97.9,
+    "upperBoundPercentage": 100
+  }
+}

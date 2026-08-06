@@ -1,0 +1,50 @@
+{
+  "name": "users/0000000000000000000/dataTypes/exercise/dataPoints/6661252888799707592",
+  "dataSource": {
+    "recordingMethod": "PASSIVELY_MEASURED",
+    "device": {
+      "formFactor": "FITNESS_BAND",
+      "displayName": "Charge 5"
+    },
+    "platform": "FITBIT"
+  },
+  "exercise": {
+    "interval": {
+      "startTime": "2026-08-05T14:26:33Z",
+      "startUtcOffset": "-14400s",
+      "endTime": "2026-08-05T14:43:38Z",
+      "endUtcOffset": "-14400s"
+    },
+    "exerciseType": "WALKING",
+    "metricsSummary": {
+      "caloriesKcal": 130,
+      "distanceMillimeters": 1284300,
+      "steps": "1606",
+      "averagePaceSecondsPerMeter": 0.7981001323678268,
+      "averageHeartRateBeatsPerMinute": "80",
+      "heartRateZoneDurations": {
+        "lightTime": "1020s",
+        "moderateTime": "0s",
+        "vigorousTime": "0s",
+        "peakTime": "0s"
+      }
+    },
+    "exerciseMetadata": {},
+    "displayName": "Walk",
+    "activeDuration": "1025s",
+    "exerciseEvents": [
+      {
+        "eventTime": "2026-08-05T14:26:33Z",
+        "eventUtcOffset": "-14400s",
+        "exerciseEventType": "START"
+      },
+      {
+        "eventTime": "2026-08-05T14:43:38Z",
+        "eventUtcOffset": "-14400s",
+        "exerciseEventType": "STOP"
+      }
+    ],
+    "updateTime": "2026-08-05T14:57:17.841848Z",
+    "createTime": "2026-08-05T14:57:17.841848Z"
+  }
+}

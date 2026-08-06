@@ -143,6 +143,23 @@ def _interval_bounds(value: dict[str, Any]) -> tuple[datetime, datetime]:
     return _parse_dt(interval.get("startTime")), _parse_dt(interval.get("endTime"))
 
 
+def _civil_day_bounds(block: dict[str, Any]) -> tuple[datetime, datetime]:
+    """Bounds for a daily-aggregate block carrying only a civil date.
+
+    Live payloads (calibrated 2026-08-06) for ``daily-resting-heart-rate`` and
+    ``daily-oxygen-saturation`` have ``{"date": {"year", "month", "day"}}`` —
+    no ``interval``, no time, no timezone. We span the UTC day; without a
+    UTC offset in the payload the user-local day is unknowable.
+    """
+    d = block.get("date") or {}
+    try:
+        day = date(int(d["year"]), int(d["month"]), int(d["day"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("missing civil date value") from exc
+    start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+    return start, start + timedelta(days=1)
+
+
 def _common_record_fields(data_point: dict[str, Any]) -> dict[str, Any]:
     return {
         "recordId": _record_id(data_point),
@@ -168,6 +185,9 @@ def _creation_date(data_point: dict[str, Any]) -> datetime:
         sample = block.get("sampleTime")
         if isinstance(sample, dict) and "physicalTime" in sample:
             return _parse_dt(sample["physicalTime"])
+        civil = block.get("date")
+        if isinstance(civil, dict) and {"year", "month", "day"} <= civil.keys():
+            return _civil_day_bounds(block)[0]
     return datetime.now(timezone.utc)
 
 
@@ -299,7 +319,13 @@ def map_floors(data_point: dict[str, Any]) -> RecordInput:
 
 
 def map_active_zone_minutes(data_point: dict[str, Any]) -> RecordInput:
-    """Active-zone minutes over an Interval."""
+    """Active-zone minutes over an Interval.
+
+    Live payload (calibrated 2026-08-06): the value field is
+    ``activeZoneMinutes`` (string, same name as the block), alongside a
+    ``heartRateZone`` label. The ``minutes`` field guessed from the discovery
+    doc never appears — reading it silently stored "0" for every point.
+    """
     block = data_point["activeZoneMinutes"]
     start, end = _interval_bounds(block)
     return RecordInput(
@@ -307,15 +333,20 @@ def map_active_zone_minutes(data_point: dict[str, Any]) -> RecordInput:
         startDate=start,
         endDate=end,
         type=HK_ACTIVE_ZONE_MINUTES,
-        value=str(block.get("minutes", "0")),
+        value=str(block.get("activeZoneMinutes") or block.get("minutes") or "0"),
         unit="min",
     )
 
 
 def map_daily_resting_heart_rate(data_point: dict[str, Any]) -> RecordInput:
-    """One daily-aggregate resting heart rate."""
+    """One daily-aggregate resting heart rate.
+
+    Live payload (calibrated 2026-08-06): civil ``date`` block only — the
+    ``interval`` shape guessed from the discovery doc never appears.
+    ``beatsPerMinute`` arrives as a string.
+    """
     block = data_point["dailyRestingHeartRate"]
-    start, end = _interval_bounds(block)
+    start, end = _civil_day_bounds(block)
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=start,
@@ -327,9 +358,13 @@ def map_daily_resting_heart_rate(data_point: dict[str, Any]) -> RecordInput:
 
 
 def map_daily_oxygen_saturation(data_point: dict[str, Any]) -> RecordInput:
-    """Daily-aggregate SpO2 average (percentage)."""
+    """Daily-aggregate SpO2 average (percentage).
+
+    Live payload (calibrated 2026-08-06): civil ``date`` block only, with
+    ``averagePercentage`` / ``lowerBoundPercentage`` / ``upperBoundPercentage``.
+    """
     block = data_point["dailyOxygenSaturation"]
-    start, end = _interval_bounds(block)
+    start, end = _civil_day_bounds(block)
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=start,
@@ -433,7 +468,7 @@ def map_exercise(data_point: dict[str, Any]) -> WorkoutInput:
         recordId=_record_id(data_point),
         startDate=start,
         endDate=end,
-        creationDate=_parse_dt(block.get("updateTime")),
+        creationDate=_creation_date(data_point),
         sourceName=SOURCE_NAME,
         durationUnit="s",
         duration=duration_seconds,
@@ -642,9 +677,10 @@ def _build_filter(data_type: str, start: datetime, end: datetime) -> str | None:
 
     One-sided lower bound only: Google's filter language rejects
     ``civil_end_time``/``end_time`` as filterable fields (verified against
-    ``steps``), so the upper bound is enforced client-side in ``sync_user``.
-    Member names per data-type family are verified empirically — see the
-    frozensets above. Only Sleep remains unfilterable.
+    ``steps``), so the upper bound is enforced client-side via
+    :func:`_window_records` before ingest. Member names per data-type family
+    are verified empirically — see the frozensets above. Only Sleep remains
+    unfilterable.
     """
     if data_type in _UNFILTERABLE_DATA_TYPES:
         return None
@@ -847,7 +883,7 @@ def _sync_one_data_type(
     data_points = list(client.iter_data_points(data_type, filter=filter_expr))
 
     if data_type == DATA_TYPE_EXERCISE:
-        workouts = [map_exercise(dp) for dp in data_points]
+        workouts = _window_records([map_exercise(dp) for dp in data_points], start, end)
         ingest_workouts(connection.customer, workouts, source=DataSource.GOOGLE_HEALTH)
         result.counts[data_type] = len(workouts)
         return []
@@ -876,22 +912,23 @@ def _sync_one_data_type(
             skipped,
             connection.pk,
         )
+    records = _window_records(records, start, end)
     ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
     result.counts[data_type] = len(records)
     return records
 
 
-def _window_records(
-    records: list[RecordInput], start: datetime, end: datetime
-) -> list[RecordInput]:
-    """Return only the records overlapping [start, end].
+def _window_records(records: list[Any], start: datetime, end: datetime) -> list[Any]:
+    """Return only the records (or workouts) overlapping [start, end].
 
-    Bounds ``SyncResult.records`` to the sync window even when the underlying
-    fetch is not (Sleep has no server-side filter, so its native fetch walks
-    the account's entire history — potentially tens of thousands of stage
-    records for an old account). Rollup types are already window-bounded, so
-    this is a cheap no-op filter for them; the hard ceiling it guarantees is
-    one window's worth of records per data type.
+    This is the client-side upper bound the server can't provide:
+    ``_build_filter`` emits a one-sided lower bound (Google rejects
+    ``civil_end_time``/``end_time`` as filterable fields) and Sleep has no
+    server-side filter at all, so an unclamped native fetch ingests
+    everything from ``start`` to the present — or, for Sleep, the account's
+    entire history. Applied before ingest in :func:`_sync_one_data_type` and
+    again when bounding ``SyncResult.records``. Rollup types are already
+    window-bounded server-side, so it's a cheap no-op filter for them.
     """
     return [rec for rec in records if rec.endDate >= start and rec.startDate <= end]
 
