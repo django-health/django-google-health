@@ -1,0 +1,20 @@
+{
+  "dataSource": {
+    "recordingMethod": "DERIVED",
+    "device": {
+      "displayName": "Charge 5"
+    },
+    "platform": "FITBIT"
+  },
+  "dailyRestingHeartRate": {
+    "date": {
+      "year": 2026,
+      "month": 8,
+      "day": 6
+    },
+    "beatsPerMinute": "53",
+    "dailyRestingHeartRateMetadata": {
+      "calculationMethod": "WITH_SLEEP"
+    }
+  }
+}

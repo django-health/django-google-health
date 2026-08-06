@@ -1,0 +1,28 @@
+{
+  "dataSource": {
+    "recordingMethod": "PASSIVELY_MEASURED",
+    "device": {
+      "displayName": "Charge 5"
+    },
+    "platform": "FITBIT"
+  },
+  "heartRate": {
+    "sampleTime": {
+      "physicalTime": "2026-08-06T12:01:29Z",
+      "utcOffset": "-14400s",
+      "civilTime": {
+        "date": {
+          "year": 2026,
+          "month": 8,
+          "day": 6
+        },
+        "time": {
+          "hours": 8,
+          "minutes": 1,
+          "seconds": 29
+        }
+      }
+    },
+    "beatsPerMinute": "72"
+  }
+}

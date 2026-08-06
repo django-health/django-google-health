@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 import respx
@@ -35,6 +36,15 @@ from googlehealth.oauth import OAuthError
 
 def _dp_url(data_type: str) -> str:
     return f"{API_BASE_URL}/{API_VERSION}/users/me/dataTypes/{data_type}/dataPoints"
+
+
+# Real payloads captured from the live API on 2026-08-06 (Fitbit Charge 5
+# account, google_user_id sanitized). Ground truth for mapper shapes.
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _fixture(name: str) -> dict:
+    return json.loads((_FIXTURES / name).read_text())
 
 
 # Pure mapper tests ----------------------------------------------------------
@@ -224,56 +234,48 @@ def test_map_floors():
 
 
 def test_map_active_zone_minutes():
-    dp = {
-        "name": "users/x/dataTypes/active-zone-minutes/dataPoints/azm1",
-        "activeZoneMinutes": {
-            "interval": {
-                "startTime": "2026-05-01T07:00:00Z",
-                "endTime": "2026-05-01T08:00:00Z",
-            },
-            "minutes": 22,
-            "updateTime": "2026-05-01T08:01:00Z",
-        },
-    }
+    """Live fixture: the value field is ``activeZoneMinutes`` (a string, same
+    name as the block), not the ``minutes`` field guessed from the discovery
+    doc — which silently mapped every live point to "0"."""
+    dp = _fixture("active_zone_minutes.json")
     rec = ingest.map_active_zone_minutes(dp)
     assert rec.type == ingest.HK_ACTIVE_ZONE_MINUTES
-    assert rec.value == "22"
+    assert rec.value == "1"
     assert rec.unit == "min"
+    assert rec.startDate == datetime(2026, 8, 5, 21, 28, tzinfo=timezone.utc)
+    assert rec.endDate == datetime(2026, 8, 5, 21, 29, tzinfo=timezone.utc)
 
 
 def test_map_daily_resting_heart_rate():
-    dp = {
-        "name": "users/x/dataTypes/daily-resting-heart-rate/dataPoints/drhr1",
-        "dailyRestingHeartRate": {
-            "interval": {
-                "startTime": "2026-05-01T00:00:00Z",
-                "endTime": "2026-05-02T00:00:00Z",
-            },
-            "beatsPerMinute": 58,
-            "updateTime": "2026-05-02T00:01:00Z",
-        },
-    }
+    """Live fixture: daily aggregates carry a civil ``date`` block only — no
+    ``interval``. The record spans the UTC day; creationDate falls back to
+    the day start (payload has no updateTime)."""
+    dp = _fixture("daily_resting_heart_rate.json")
     rec = ingest.map_daily_resting_heart_rate(dp)
     assert rec.type == ingest.HK_RESTING_HEART_RATE
-    assert rec.value == "58"
+    assert rec.value == "53"
+    assert rec.unit == "count/min"
+    assert rec.startDate == datetime(2026, 8, 6, tzinfo=timezone.utc)
+    assert rec.endDate == datetime(2026, 8, 7, tzinfo=timezone.utc)
+    assert rec.creationDate == datetime(2026, 8, 6, tzinfo=timezone.utc)
 
 
 def test_map_daily_oxygen_saturation():
-    dp = {
-        "name": "users/x/dataTypes/daily-oxygen-saturation/dataPoints/dox1",
-        "dailyOxygenSaturation": {
-            "interval": {
-                "startTime": "2026-05-01T00:00:00Z",
-                "endTime": "2026-05-02T00:00:00Z",
-            },
-            "averagePercentage": 96.5,
-            "updateTime": "2026-05-02T00:01:00Z",
-        },
-    }
+    """Live fixture: same civil-date shape as daily-resting-heart-rate, with
+    averagePercentage / lowerBoundPercentage / upperBoundPercentage."""
+    dp = _fixture("daily_oxygen_saturation.json")
     rec = ingest.map_daily_oxygen_saturation(dp)
     assert rec.type == ingest.HK_OXYGEN_SATURATION
-    assert rec.value == "96.5"
+    assert rec.value == "99.3"
     assert rec.unit == "%"
+    assert rec.startDate == datetime(2026, 8, 6, tzinfo=timezone.utc)
+    assert rec.endDate == datetime(2026, 8, 7, tzinfo=timezone.utc)
+
+
+def test_map_daily_missing_date_raises():
+    dp = {"dailyRestingHeartRate": {"beatsPerMinute": "50"}}
+    with pytest.raises(ValueError, match="missing civil date"):
+        ingest.map_daily_resting_heart_rate(dp)
 
 
 def test_map_body_fat():
@@ -373,6 +375,60 @@ def test_map_exercise():
     assert workout.distanceUnit == "km"
     keys = {entry.key for entry in workout.metadataEntry or []}
     assert {"steps", "average_heart_rate_bpm"} <= keys
+
+
+def test_map_heart_rate_live_fixture():
+    """Live shape: sampleTime.physicalTime + string beatsPerMinute."""
+    dp = _fixture("heart_rate_sample.json")
+    rec = ingest.map_heart_rate(dp)
+    assert rec.type == ingest.HK_HEART_RATE
+    assert rec.value == "72"
+    assert rec.startDate == datetime(2026, 8, 6, 12, 1, 29, tzinfo=timezone.utc)
+    assert rec.startDate == rec.endDate
+
+
+def test_map_sleep_stages_live_fixture():
+    """Live STAGES session: stage bounds flat on the stage object, labels
+    upper-case LIGHT / DEEP / REM / AWAKE — one record per stage."""
+    dp = _fixture("sleep_stages.json")
+    stages = dp["sleep"]["stages"]
+    records = ingest.map_sleep_session(dp)
+    assert len(records) == len(stages)
+    got = {}
+    for rec in records:
+        assert rec.type == SLEEP_TYPE
+        got[rec.value] = got.get(rec.value, 0) + 1
+    # Cross-check against the payload's own stagesSummary counts.
+    summary = {
+        s["type"]: int(s["count"]) for s in dp["sleep"]["summary"]["stagesSummary"]
+    }
+    assert got[str(SleepValue.ASLEEP_CORE)] == summary["LIGHT"]
+    assert got[str(SleepValue.ASLEEP_DEEP)] == summary["DEEP"]
+    assert got[str(SleepValue.ASLEEP_REM)] == summary["REM"]
+    assert got[str(SleepValue.AWAKE)] == summary["AWAKE"]
+    # creationDate comes from the session's updateTime.
+    assert records[0].creationDate == datetime(
+        2026, 8, 6, 11, 30, 20, 343679, tzinfo=timezone.utc
+    )
+
+
+def test_map_exercise_live_fixture():
+    dp = _fixture("exercise_walking.json")
+    workout = ingest.map_exercise(dp)
+    assert workout.workoutActivityType == "WALKING"
+    assert workout.caloriesBurned == 130.0
+    assert workout.creationDate == datetime(
+        2026, 8, 5, 14, 57, 17, 841848, tzinfo=timezone.utc
+    )
+
+
+def test_map_exercise_missing_update_time_falls_back():
+    """List responses may omit updateTime (only get-by-id includes it) — the
+    mapper must fall back to the interval start instead of raising."""
+    dp = _fixture("exercise_walking.json")
+    del dp["exercise"]["updateTime"]
+    workout = ingest.map_exercise(dp)
+    assert workout.creationDate == datetime(2026, 8, 5, 14, 26, 33, tzinfo=timezone.utc)
 
 
 # sync_user integration ------------------------------------------------------
@@ -919,6 +975,44 @@ def test_build_filter_member_per_data_type_family(data_type, expected):
 
 
 @respx.mock
+def test_sync_user_clamps_ingest_to_window(connection, customer):
+    """The server filter is a one-sided lower bound (Google rejects end-time
+    filters), so points past ``end`` come back in the response — they must be
+    clamped client-side before ingest, not stored (#13)."""
+
+    def _steps_point(pid: str, day: int) -> dict:
+        return {
+            "name": f"users/x/dataTypes/steps/dataPoints/{pid}",
+            "steps": {
+                "interval": {
+                    "startTime": f"2026-05-{day:02d}T10:00:00Z",
+                    "endTime": f"2026-05-{day:02d}T10:15:00Z",
+                },
+                "count": 100,
+            },
+        }
+
+    respx.get(_dp_url(DATA_TYPE_STEPS)).mock(
+        return_value=Response(
+            200, json=_page([_steps_point("in-window", 1), _steps_point("past-end", 9)])
+        )
+    )
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_STEPS],
+        compute_basal=False,
+    )
+
+    assert result.counts[DATA_TYPE_STEPS] == 1
+    records = Record.objects.filter(customer=customer)
+    assert records.count() == 1
+    assert records.get().startDate == datetime(2026, 5, 1, 10, 0, tzinfo=timezone.utc)
+
+
+@respx.mock
 def test_sync_user_sends_sample_time_filter_for_heart_rate(connection):
     route = respx.get(_dp_url(DATA_TYPE_HEART_RATE)).mock(
         return_value=Response(200, json=_page([]))
@@ -1233,10 +1327,11 @@ def test_collect_records_is_window_bounded(connection, customer):
         collect_records=True,
     )
 
-    # Both ingested (backup store keeps full history)...
-    assert result.counts[DATA_TYPE_SLEEP] == 2
-    assert Record.objects.filter(customer=customer, type=SLEEP_TYPE).count() == 2
-    # ...but only the in-window record is retained in memory.
+    # Only the in-window record is ingested (#13: Sleep has no server-side
+    # filter, so without the clamp a sync would ingest the account's entire
+    # history) — and the same clamp bounds the in-memory collection.
+    assert result.counts[DATA_TYPE_SLEEP] == 1
+    assert Record.objects.filter(customer=customer, type=SLEEP_TYPE).count() == 1
     assert len(result.records) == 1
     assert result.records[0].startDate == datetime(
         2026, 5, 1, 3, 0, tzinfo=timezone.utc
