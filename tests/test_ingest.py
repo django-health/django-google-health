@@ -120,6 +120,21 @@ def test_map_weight():
     assert rec.unit == "kg"
 
 
+def test_map_weight_live_fixture():
+    """Live fixture (manual weigh-in logged in the Fitbit app, 2026-08-07):
+    integer ``weightGrams`` + ``sampleTime.physicalTime``, per the discovery
+    doc's Weight schema."""
+    dp = _fixture("weight_manual.json")
+    rec = ingest.map_weight(dp)
+    assert rec.type == ingest.HK_BODY_MASS
+    assert rec.value == "87.09"
+    assert rec.unit == "kg"
+    assert rec.startDate == datetime(
+        2026, 8, 7, 14, 46, 22, 749348, tzinfo=timezone.utc
+    )
+    assert rec.startDate == rec.endDate
+
+
 def test_map_sleep_session_decomposes_stages():
     dp = {
         "name": "users/x/dataTypes/sleep/dataPoints/s1",
