@@ -1,0 +1,40 @@
+{
+  "dataSource": {
+    "recordingMethod": "PASSIVELY_MEASURED",
+    "device": {
+      "displayName": "Charge 5"
+    },
+    "platform": "FITBIT"
+  },
+  "steps": {
+    "interval": {
+      "startTime": "2026-08-06T12:01:00Z",
+      "startUtcOffset": "-14400s",
+      "endTime": "2026-08-06T12:02:00Z",
+      "endUtcOffset": "-14400s",
+      "civilStartTime": {
+        "date": {
+          "year": 2026,
+          "month": 8,
+          "day": 6
+        },
+        "time": {
+          "hours": 8,
+          "minutes": 1
+        }
+      },
+      "civilEndTime": {
+        "date": {
+          "year": 2026,
+          "month": 8,
+          "day": 6
+        },
+        "time": {
+          "hours": 8,
+          "minutes": 2
+        }
+      }
+    },
+    "count": "1"
+  }
+}

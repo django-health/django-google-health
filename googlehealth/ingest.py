@@ -269,11 +269,21 @@ def map_weight(data_point: dict[str, Any]) -> RecordInput:
 
 
 def map_distance(data_point: dict[str, Any]) -> RecordInput:
-    """Distance accumulated over an Interval. Google reports millimeters."""
+    """Distance accumulated over an Interval. Google reports millimeters.
+
+    Live payload (calibrated 2026-08-07): the field is ``millimeters``
+    (string), matching the discovery doc's ``Distance`` schema. The
+    ``distanceMillimeters`` spelling only exists in ``MetricsSummary``
+    (exercise summaries) — reading it here silently stored "0.0" for every
+    native-path point. Old spellings kept as fallbacks.
+    """
     block = data_point["distance"]
     start, end = _interval_bounds(block)
     distance_mm = float(
-        block.get("distanceMillimeters") or block.get("distanceMillimiters") or 0
+        block.get("millimeters")
+        or block.get("distanceMillimeters")
+        or block.get("distanceMillimiters")
+        or 0
     )
     return RecordInput(
         **_common_record_fields(data_point),
@@ -286,13 +296,18 @@ def map_distance(data_point: dict[str, Any]) -> RecordInput:
 
 
 def map_altitude(data_point: dict[str, Any]) -> RecordInput:
-    """Elevation gained over an Interval. Google reports millimeters."""
+    """Elevation gained over an Interval. Google reports millimeters.
+
+    Discovery doc's ``Altitude`` schema says ``gainMillimeters`` (string).
+    Not yet live-verified — no altimeter device on the calibration account —
+    but the discovery doc has matched every live-verified shape to date.
+    ``elevationGainMillimeters`` was borrowed from ``MetricsSummary``
+    (exercise summaries) and kept only as a fallback.
+    """
     block = data_point["altitude"]
     start, end = _interval_bounds(block)
     altitude_mm = float(
-        block.get("elevationGainMillimeters")
-        or block.get("elevationGainMillimiters")
-        or 0
+        block.get("gainMillimeters") or block.get("elevationGainMillimeters") or 0
     )
     return RecordInput(
         **_common_record_fields(data_point),
@@ -305,7 +320,12 @@ def map_altitude(data_point: dict[str, Any]) -> RecordInput:
 
 
 def map_floors(data_point: dict[str, Any]) -> RecordInput:
-    """Floors climbed over an Interval."""
+    """Floors climbed over an Interval.
+
+    Discovery doc's ``Floors`` schema says ``count`` (string). Not yet
+    live-verified (no altimeter device on the calibration account); the
+    guessed ``floorsClimbed`` kept only as a fallback.
+    """
     block = data_point["floors"]
     start, end = _interval_bounds(block)
     return RecordInput(
@@ -313,7 +333,7 @@ def map_floors(data_point: dict[str, Any]) -> RecordInput:
         startDate=start,
         endDate=end,
         type=HK_FLIGHTS_CLIMBED,
-        value=str(block.get("floorsClimbed", "0")),
+        value=str(block.get("count") or block.get("floorsClimbed") or "0"),
         unit="count",
     )
 
@@ -322,9 +342,10 @@ def map_active_zone_minutes(data_point: dict[str, Any]) -> RecordInput:
     """Active-zone minutes over an Interval.
 
     Live payload (calibrated 2026-08-06): the value field is
-    ``activeZoneMinutes`` (string, same name as the block), alongside a
-    ``heartRateZone`` label. The ``minutes`` field guessed from the discovery
-    doc never appears — reading it silently stored "0" for every point.
+    ``activeZoneMinutes`` (string, same name as the block, matching the
+    discovery doc), alongside a ``heartRateZone`` label. The guessed
+    ``minutes`` field never appears — reading it silently stored "0" for
+    every point.
     """
     block = data_point["activeZoneMinutes"]
     start, end = _interval_bounds(block)

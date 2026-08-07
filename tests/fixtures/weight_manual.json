@@ -1,0 +1,27 @@
+{
+  "name": "users/0000000000000000000/dataTypes/weight/dataPoints/6685309773198399080",
+  "dataSource": {
+    "recordingMethod": "MANUAL",
+    "platform": "FITBIT"
+  },
+  "weight": {
+    "sampleTime": {
+      "physicalTime": "2026-08-07T14:46:22.749348Z",
+      "utcOffset": "-14400s",
+      "civilTime": {
+        "date": {
+          "year": 2026,
+          "month": 8,
+          "day": 7
+        },
+        "time": {
+          "hours": 10,
+          "minutes": 46,
+          "seconds": 22,
+          "nanos": 749348000
+        }
+      }
+    },
+    "weightGrams": 87090
+  }
+}

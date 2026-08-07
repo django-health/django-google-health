@@ -120,6 +120,21 @@ def test_map_weight():
     assert rec.unit == "kg"
 
 
+def test_map_weight_live_fixture():
+    """Live fixture (manual weigh-in logged in the Fitbit app, 2026-08-07):
+    integer ``weightGrams`` + ``sampleTime.physicalTime``, per the discovery
+    doc's Weight schema."""
+    dp = _fixture("weight_manual.json")
+    rec = ingest.map_weight(dp)
+    assert rec.type == ingest.HK_BODY_MASS
+    assert rec.value == "87.09"
+    assert rec.unit == "kg"
+    assert rec.startDate == datetime(
+        2026, 8, 7, 14, 46, 22, 749348, tzinfo=timezone.utc
+    )
+    assert rec.startDate == rec.endDate
+
+
 def test_map_sleep_session_decomposes_stages():
     dp = {
         "name": "users/x/dataTypes/sleep/dataPoints/s1",
@@ -180,6 +195,17 @@ def test_map_sleep_session_decomposes_stages():
 
 
 def test_map_distance():
+    """Live fixture: the field is ``millimeters`` (string), matching the
+    discovery doc — the guessed ``distanceMillimeters`` silently stored
+    "0.0" for every native-path point."""
+    dp = _fixture("distance.json")
+    rec = ingest.map_distance(dp)
+    assert rec.type == ingest.HK_DISTANCE_WALKING_RUNNING
+    assert float(rec.value) == pytest.approx(0.7)
+    assert rec.unit == "m"
+
+
+def test_map_distance_legacy_field_fallback():
     dp = {
         "name": "users/x/dataTypes/distance/dataPoints/d1",
         "distance": {
@@ -188,16 +214,23 @@ def test_map_distance():
                 "endTime": "2026-05-01T10:15:00Z",
             },
             "distanceMillimeters": 1_609_344,  # 1 mile
-            "updateTime": "2026-05-01T10:16:00Z",
         },
     }
     rec = ingest.map_distance(dp)
-    assert rec.type == ingest.HK_DISTANCE_WALKING_RUNNING
     assert float(rec.value) == pytest.approx(1609.344)
-    assert rec.unit == "m"
+
+
+def test_map_steps_live_fixture():
+    dp = _fixture("steps.json")
+    rec = ingest.map_steps(dp)
+    assert rec.type == str(ActivityMetric.STEPS)
+    assert rec.value == "1"
+    assert rec.unit == "count"
 
 
 def test_map_altitude():
+    """Discovery-doc shape (``gainMillimeters``, string) — not yet
+    live-verified; the calibration account's device has no altimeter."""
     dp = {
         "name": "users/x/dataTypes/altitude/dataPoints/a1",
         "altitude": {
@@ -205,8 +238,7 @@ def test_map_altitude():
                 "startTime": "2026-05-01T10:00:00Z",
                 "endTime": "2026-05-01T10:30:00Z",
             },
-            "elevationGainMillimeters": 12_500,  # 12.5 m
-            "updateTime": "2026-05-01T10:31:00Z",
+            "gainMillimeters": "12500",  # 12.5 m
         },
     }
     rec = ingest.map_altitude(dp)
@@ -216,6 +248,7 @@ def test_map_altitude():
 
 
 def test_map_floors():
+    """Discovery-doc shape (``count``, string) — not yet live-verified."""
     dp = {
         "name": "users/x/dataTypes/floors/dataPoints/f1",
         "floors": {
@@ -223,8 +256,7 @@ def test_map_floors():
                 "startTime": "2026-05-01T08:00:00Z",
                 "endTime": "2026-05-01T08:15:00Z",
             },
-            "floorsClimbed": 3,
-            "updateTime": "2026-05-01T08:16:00Z",
+            "count": "3",
         },
     }
     rec = ingest.map_floors(dp)
