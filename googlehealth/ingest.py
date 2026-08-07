@@ -223,9 +223,12 @@ def map_active_energy_burned(data_point: dict[str, Any]) -> RecordInput:
 
     Live-calibrated 2026-08-07: per-minute intervals with a ``kcal`` number.
     This is Google's own active series, matching Apple ActiveEnergyBurned
-    semantics — it replaced reconstructing active energy as
-    ``total-calories − estimated basal``, which a week of side-by-side daily
-    rollups showed overestimating by ~430–800 kcal/day.
+    semantics — confirmed by the official Fitbit→Google migration table
+    ("activity-only burn, excluding basal rate",
+    https://developers.google.com/health — data type mappings). It replaced
+    reconstructing active energy as ``total-calories − estimated basal``,
+    which a week of side-by-side daily rollups showed overestimating by
+    ~430–800 kcal/day.
     """
     block = data_point["activeEnergyBurned"]
     start, end = _interval_bounds(block)
@@ -721,6 +724,12 @@ def compute_basal_calories(
     live profile payload carries ``age`` only (no gender, DOB, or height —
     issue #29), so that path always emitted a flat 2000 kcal default. For
     profile-supplied BMR math, use ``healthdatamodel.bmr`` directly.
+
+    Google does define a true BMR series (``basal-energy-burned``, mapped
+    from Fitbit's ``caloriesBMR`` per the official migration table), but as
+    of 2026-08-07 it supports only ``list``/``reconcile`` (no rollups) and
+    returns zero points for Fitbit accounts. If it ever populates, prefer it
+    over this derivation.
 
     Days are 86400s rollup windows anchored at ``start``'s UTC midnight. A day
     with no total-calories window is skipped, not defaulted (device not yet
