@@ -19,12 +19,12 @@ from googlehealth.client import GoogleHealthClient
 from googlehealth.constants import (
     API_BASE_URL,
     API_VERSION,
+    DATA_TYPE_ACTIVE_ENERGY_BURNED,
     DATA_TYPE_DAILY_RESTING_HEART_RATE,
     DATA_TYPE_EXERCISE,
     DATA_TYPE_HEART_RATE,
     DATA_TYPE_SLEEP,
     DATA_TYPE_STEPS,
-    DATA_TYPE_TOTAL_CALORIES,
     DATA_TYPE_WEIGHT,
     OAUTH_TOKEN_URL,
     SCOPE_ACTIVITY_AND_FITNESS_READONLY,
@@ -72,22 +72,17 @@ def test_map_steps():
     assert rec.endDate == datetime(2026, 5, 1, 10, 15, tzinfo=timezone.utc)
 
 
-def test_map_total_calories_uses_active_calories_type():
-    dp = {
-        "name": "users/x/dataTypes/total-calories/dataPoints/c1",
-        "totalCalories": {
-            "interval": {
-                "startTime": "2026-05-01T10:00:00Z",
-                "endTime": "2026-05-01T10:15:00Z",
-            },
-            "caloriesKcal": 42.5,
-            "updateTime": "2026-05-01T10:20:00Z",
-        },
-    }
-    rec = ingest.map_total_calories(dp)
+def test_map_active_energy_burned_live_fixture():
+    """Live fixture (2026-08-07): per-minute interval with a ``kcal`` number.
+    Google's own basal-excluded series — replaced reconstructing active energy
+    from total-calories minus an estimated basal rate."""
+    dp = _fixture("active_energy_burned.json")
+    rec = ingest.map_active_energy_burned(dp)
     assert rec.type == str(ActivityMetric.ACTIVE_CALORIES)
-    assert rec.value == "42.5"
+    assert float(rec.value) == pytest.approx(0.793398)
     assert rec.unit == "kcal"
+    assert rec.startDate == datetime(2026, 8, 7, 15, 4, tzinfo=timezone.utc)
+    assert rec.endDate == datetime(2026, 8, 7, 15, 5, tzinfo=timezone.utc)
 
 
 def test_map_heart_rate_point_in_time():
@@ -345,16 +340,17 @@ def test_default_data_types_includes_all_mapped_types():
     """Ensure the default sweep covers every mapper we expose."""
     assert set(ingest.DEFAULT_DATA_TYPES) >= {
         DATA_TYPE_STEPS,
+        DATA_TYPE_ACTIVE_ENERGY_BURNED,
         DATA_TYPE_HEART_RATE,
         DATA_TYPE_WEIGHT,
         DATA_TYPE_SLEEP,
         DATA_TYPE_EXERCISE,
     }
-    # total-calories and floors are excluded from DEFAULT_DATA_TYPES because
-    # Google rejects `list` for them — they need a dailyRollUp path we haven't
-    # built yet. They're still mapped (the mapper functions exist) so the
-    # consumer can wire them in once that path lands.
-    assert DATA_TYPE_TOTAL_CALORIES in ingest.ROLLUP_ONLY_DATA_TYPES
+    # floors is excluded from DEFAULT_DATA_TYPES because Google rejects `list`
+    # for it — it only joins the sweep when a resolution is set (rollUp path).
+    from googlehealth.constants import DATA_TYPE_FLOORS
+
+    assert DATA_TYPE_FLOORS in ingest.ROLLUP_ONLY_DATA_TYPES
     # And the new ones from slice 7.
     from googlehealth.constants import (
         DATA_TYPE_ACTIVE_ZONE_MINUTES,
@@ -484,13 +480,13 @@ def test_sync_user_persists_each_data_type(connection, customer):
         },
     }
     calories_dp = {
-        "name": "users/me/dataTypes/total-calories/dataPoints/c1",
-        "totalCalories": {
+        "name": "users/me/dataTypes/active-energy-burned/dataPoints/c1",
+        "activeEnergyBurned": {
             "interval": {
                 "startTime": "2026-05-01T10:00:00Z",
                 "endTime": "2026-05-01T10:15:00Z",
             },
-            "caloriesKcal": 35,
+            "kcal": 35,
             "updateTime": "2026-05-01T10:16:00Z",
         },
     }
@@ -551,7 +547,7 @@ def test_sync_user_persists_each_data_type(connection, customer):
 
     for data_type, dp in [
         (DATA_TYPE_STEPS, steps_dp),
-        (DATA_TYPE_TOTAL_CALORIES, calories_dp),
+        (DATA_TYPE_ACTIVE_ENERGY_BURNED, calories_dp),
         (DATA_TYPE_HEART_RATE, hr_dp),
         (DATA_TYPE_WEIGHT, weight_dp),
         (DATA_TYPE_SLEEP, sleep_dp),
@@ -568,7 +564,7 @@ def test_sync_user_persists_each_data_type(connection, customer):
         end=end,
         data_types=[
             DATA_TYPE_STEPS,
-            DATA_TYPE_TOTAL_CALORIES,
+            DATA_TYPE_ACTIVE_ENERGY_BURNED,
             DATA_TYPE_HEART_RATE,
             DATA_TYPE_WEIGHT,
             DATA_TYPE_SLEEP,
@@ -579,7 +575,7 @@ def test_sync_user_persists_each_data_type(connection, customer):
 
     # Per-type counts
     assert result.counts[DATA_TYPE_STEPS] == 1
-    assert result.counts[DATA_TYPE_TOTAL_CALORIES] == 1
+    assert result.counts[DATA_TYPE_ACTIVE_ENERGY_BURNED] == 1
     assert result.counts[DATA_TYPE_HEART_RATE] == 1
     assert result.counts[DATA_TYPE_WEIGHT] == 1
     assert result.counts[DATA_TYPE_SLEEP] == 2  # two stages
@@ -878,11 +874,11 @@ def test_sync_user_with_resolution_falls_back_to_list_for_unsupported_types(conn
 
 @respx.mock
 def test_sync_user_resolution_expands_to_rollup_only_types(connection):
-    """When data_types is None + resolution_minutes is set, total-calories +
-    floors join the default sweep (the list endpoint rejects them)."""
+    """When data_types is None + resolution_minutes is set, floors joins the
+    default sweep (the list endpoint rejects it)."""
 
     # Mock every data type's rollup endpoint as empty; only assert that
-    # total-calories was queried at all.
+    # floors was queried at all.
     for dt in ingest.DEFAULT_DATA_TYPES:
         if dt in ingest._ROLLUP_UNSUPPORTED_DATA_TYPES:
             respx.get(_dp_url(dt)).mock(return_value=Response(200, json=_page([])))
@@ -899,7 +895,6 @@ def test_sync_user_resolution_expands_to_rollup_only_types(connection):
                         {
                             "startTime": "2026-05-01T00:00:00Z",
                             "endTime": "2026-05-02T00:00:00Z",
-                            "totalCalories": {"kcalSum": 2200.5},
                             "floors": {"countSum": "12"},
                         }
                     ],
@@ -918,12 +913,11 @@ def test_sync_user_resolution_expands_to_rollup_only_types(connection):
         compute_basal=False,
     )
 
-    assert "total-calories" in result.counts
     assert "floors" in result.counts
-    # Each ROLLUP_ONLY type fetch returned one rollup point with both blocks
-    # populated — the relevant mapper produced one Record.
-    assert result.counts["total-calories"] == 1
     assert result.counts["floors"] == 1
+    # total-calories is gone entirely — active energy comes from the
+    # active-energy-burned series in DEFAULT_DATA_TYPES instead.
+    assert "total-calories" not in result.counts
 
 
 def test_sync_user_rejects_negative_resolution(connection):
@@ -1065,11 +1059,11 @@ def test_sync_user_sends_sample_time_filter_for_heart_rate(connection):
 
 
 @respx.mock
-def test_sync_user_basal_rate_converts_total_calories_to_active(connection, customer):
-    """With basal_rate set, total-calories windows are stored as ACTIVE energy:
-    pro-rata basal subtracted, floored at 0 (Apple ActiveEnergyBurned semantics
-    — a sedentary window is 0 active kcal, not its BMR share)."""
-    respx.post(_rollup_url(DATA_TYPE_TOTAL_CALORIES)).mock(
+def test_sync_user_active_energy_burned_rollup(connection, customer):
+    """Rollup path for active-energy-burned: kcalSum stored as ACTIVE energy
+    unmodified — the series is already basal-excluded, so no conversion (the
+    pre-0.9.0 basal_rate reconstruction is gone)."""
+    respx.post(_rollup_url(DATA_TYPE_ACTIVE_ENERGY_BURNED)).mock(
         return_value=Response(
             200,
             json={
@@ -1077,12 +1071,7 @@ def test_sync_user_basal_rate_converts_total_calories_to_active(connection, cust
                     {
                         "startTime": "2026-05-01T00:00:00Z",
                         "endTime": "2026-05-01T00:15:00Z",
-                        "totalCalories": {"kcalSum": 25.0},
-                    },
-                    {
-                        "startTime": "2026-05-01T00:15:00Z",
-                        "endTime": "2026-05-01T00:30:00Z",
-                        "totalCalories": {"kcalSum": 5.0},
+                        "activeEnergyBurned": {"kcalSum": 25.0},
                     },
                 ],
                 "nextPageToken": "",
@@ -1094,42 +1083,7 @@ def test_sync_user_basal_rate_converts_total_calories_to_active(connection, cust
         connection,
         start=datetime(2026, 5, 1, tzinfo=timezone.utc),
         end=datetime(2026, 5, 2, tzinfo=timezone.utc),
-        data_types=[DATA_TYPE_TOTAL_CALORIES],
-        resolution_minutes=15,
-        compute_basal=False,
-        basal_rate=960.0,  # 960 kcal/day -> exactly 10 kcal per 900s window
-    )
-
-    records = Record.objects.filter(
-        customer=customer, type=str(ActivityMetric.ACTIVE_CALORIES)
-    ).order_by("startDate")
-    assert [r.value for r in records] == ["15.000", "0.000"]
-
-
-@respx.mock
-def test_sync_user_without_basal_rate_keeps_raw_totals(connection, customer):
-    """Back-compat: no basal_rate -> totals stored unmodified."""
-    respx.post(_rollup_url(DATA_TYPE_TOTAL_CALORIES)).mock(
-        return_value=Response(
-            200,
-            json={
-                "rollupDataPoints": [
-                    {
-                        "startTime": "2026-05-01T00:00:00Z",
-                        "endTime": "2026-05-01T00:15:00Z",
-                        "totalCalories": {"kcalSum": 25.0},
-                    },
-                ],
-                "nextPageToken": "",
-            },
-        )
-    )
-
-    ingest.sync_user(
-        connection,
-        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
-        data_types=[DATA_TYPE_TOTAL_CALORIES],
+        data_types=[DATA_TYPE_ACTIVE_ENERGY_BURNED],
         resolution_minutes=15,
         compute_basal=False,
     )

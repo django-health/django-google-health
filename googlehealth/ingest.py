@@ -2,7 +2,7 @@
 
 Mappers cover the beachhead data types:
 
-  steps, total-calories, heart-rate, weight  → :class:`RecordInput` (Sample/Interval)
+  steps, active-energy-burned, heart-rate, weight → :class:`RecordInput` (Sample/Interval)
   sleep                                       → list[:class:`RecordInput`] (one per stage)
   exercise                                    → :class:`WorkoutInput`
 
@@ -12,10 +12,12 @@ daily-resting-heart-rate, daily-oxygen-saturation, body-fat.
 Caveats — Google Health's data model isn't 1:1 with Apple HealthKit (which is what
 ``healthdatamodel`` schemas mirror):
 
-* Google exposes a single ``total-calories`` type. We map it to
-  ``ActivityMetric.ACTIVE_CALORIES`` because that's the closest semantic match
-  (Fitbit's caloriesOut historically lands there). ``BASAL_CALORIES`` is not
-  available from the Google Health API.
+* Energy: ``active-energy-burned`` (basal-excluded, live since ~Aug 2026) maps
+  to ``ActivityMetric.ACTIVE_CALORIES``. ``total-calories`` is deliberately not
+  synced — totals include basal burn, and storing them as ACTIVE inflates
+  downstream MET math. ``basal-energy-burned`` exists in the API schema but
+  returns no data for Fitbit accounts (probed 2026-08-07), so the daily
+  ``BASAL_CALORIES`` series still comes from :func:`compute_basal_calories`.
 * ``HKAltitudeGain`` is a non-standard identifier — Apple HealthKit doesn't have
   a direct analog for cumulative elevation gain over an interval.
 
@@ -40,6 +42,7 @@ from healthdatamodel.schemas import MetadataEntry, RecordInput, WorkoutInput
 
 from .client import GoogleHealthAPIError, GoogleHealthClient
 from .constants import (
+    DATA_TYPE_ACTIVE_ENERGY_BURNED,
     DATA_TYPE_ACTIVE_ZONE_MINUTES,
     DATA_TYPE_ALTITUDE,
     DATA_TYPE_BODY_FAT,
@@ -52,7 +55,6 @@ from .constants import (
     DATA_TYPE_HEIGHT,
     DATA_TYPE_SLEEP,
     DATA_TYPE_STEPS,
-    DATA_TYPE_TOTAL_CALORIES,
     DATA_TYPE_WEIGHT,
     ERROR_REASON_ACCOUNT_NOT_LINKED,
     SOURCE_NAME,
@@ -226,15 +228,23 @@ def map_steps(data_point: dict[str, Any]) -> RecordInput:
     )
 
 
-def map_total_calories(data_point: dict[str, Any]) -> RecordInput:
-    block = data_point["totalCalories"]
+def map_active_energy_burned(data_point: dict[str, Any]) -> RecordInput:
+    """Basal-excluded energy over an Interval (Fitbit "activity calories").
+
+    Live-calibrated 2026-08-07: per-minute intervals with a ``kcal`` number.
+    This is Google's own active series, matching Apple ActiveEnergyBurned
+    semantics — it replaced reconstructing active energy as
+    ``total-calories − estimated basal``, which a week of side-by-side daily
+    rollups showed overestimating by ~430–800 kcal/day.
+    """
+    block = data_point["activeEnergyBurned"]
     start, end = _interval_bounds(block)
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=start,
         endDate=end,
         type=str(ActivityMetric.ACTIVE_CALORIES),
-        value=str(block.get("caloriesKcal", "0")),
+        value=str(block.get("kcal", "0")),
         unit="kcal",
     )
 
@@ -511,7 +521,7 @@ def map_exercise(data_point: dict[str, Any]) -> WorkoutInput:
 
 _RECORD_MAPPERS: dict[str, Callable[[dict[str, Any]], list[RecordInput]]] = {
     DATA_TYPE_STEPS: lambda dp: [map_steps(dp)],
-    DATA_TYPE_TOTAL_CALORIES: lambda dp: [map_total_calories(dp)],
+    DATA_TYPE_ACTIVE_ENERGY_BURNED: lambda dp: [map_active_energy_burned(dp)],
     DATA_TYPE_HEART_RATE: lambda dp: [map_heart_rate(dp)],
     DATA_TYPE_WEIGHT: lambda dp: [map_weight(dp)],
     DATA_TYPE_SLEEP: map_sleep_session,
@@ -529,10 +539,7 @@ _RECORD_MAPPERS: dict[str, Callable[[dict[str, Any]], list[RecordInput]]] = {
 # They're absent from DEFAULT_DATA_TYPES (so the default native-resolution sync
 # skips them) but become available when the caller passes
 # ``resolution_minutes=N`` to :func:`sync_user`.
-ROLLUP_ONLY_DATA_TYPES: tuple[str, ...] = (
-    DATA_TYPE_TOTAL_CALORIES,
-    DATA_TYPE_FLOORS,
-)
+ROLLUP_ONLY_DATA_TYPES: tuple[str, ...] = (DATA_TYPE_FLOORS,)
 
 # Types that don't support the rollUp endpoint at all (Sessions, point-in-time
 # Samples without an aggregation, pre-aggregated Daily summaries). When a
@@ -565,7 +572,7 @@ def _rollup_value(
         DATA_TYPE_WEIGHT: "weight",
         DATA_TYPE_BODY_FAT: "bodyFat",
         DATA_TYPE_ALTITUDE: "altitude",
-        DATA_TYPE_TOTAL_CALORIES: "totalCalories",
+        DATA_TYPE_ACTIVE_ENERGY_BURNED: "activeEnergyBurned",
         DATA_TYPE_FLOORS: "floors",
         DATA_TYPE_ACTIVE_ZONE_MINUTES: "activeZoneMinutes",
     }.get(data_type, key)
@@ -586,7 +593,7 @@ def _rollup_value(
         return str(float(block["weightGramsAvg"]) / 1000.0), "kg"
     if data_type == DATA_TYPE_BODY_FAT and "bodyFatPercentageAvg" in block:
         return str(block["bodyFatPercentageAvg"]), "%"
-    if data_type == DATA_TYPE_TOTAL_CALORIES and "kcalSum" in block:
+    if data_type == DATA_TYPE_ACTIVE_ENERGY_BURNED and "kcalSum" in block:
         return str(block["kcalSum"]), "kcal"
     if data_type == DATA_TYPE_ACTIVE_ZONE_MINUTES:
         # Sum across all heart-rate zones for a single "active zone minutes" value.
@@ -620,7 +627,7 @@ def _rollup_to_record(data_type: str, point: dict[str, Any]) -> RecordInput | No
         DATA_TYPE_WEIGHT: HK_BODY_MASS,
         DATA_TYPE_BODY_FAT: HK_BODY_FAT_PERCENTAGE,
         DATA_TYPE_ALTITUDE: HK_ALTITUDE_GAIN,
-        DATA_TYPE_TOTAL_CALORIES: str(ActivityMetric.ACTIVE_CALORIES),
+        DATA_TYPE_ACTIVE_ENERGY_BURNED: str(ActivityMetric.ACTIVE_CALORIES),
         DATA_TYPE_FLOORS: HK_FLIGHTS_CLIMBED,
         DATA_TYPE_ACTIVE_ZONE_MINUTES: HK_ACTIVE_ZONE_MINUTES,
     }[data_type]
@@ -639,6 +646,7 @@ def _rollup_to_record(data_type: str, point: dict[str, Any]) -> RecordInput | No
 
 DEFAULT_DATA_TYPES: tuple[str, ...] = (
     DATA_TYPE_STEPS,
+    DATA_TYPE_ACTIVE_ENERGY_BURNED,
     DATA_TYPE_HEART_RATE,
     DATA_TYPE_WEIGHT,
     DATA_TYPE_HEIGHT,
@@ -843,22 +851,6 @@ def compute_basal_calories(
     return len(records)
 
 
-def _totals_to_active_energy(
-    records: list[RecordInput], basal_rate: float
-) -> list[RecordInput]:
-    """Convert total-calories windows to active energy, in place.
-
-    Each window's pro-rata share of ``basal_rate`` (kcal/day) is subtracted
-    and the result floored at 0, matching Apple/HealthKit ActiveEnergyBurned
-    semantics (a fully sedentary window is 0 active kcal, not its BMR share).
-    """
-    for rec in records:
-        seconds = (rec.endDate - rec.startDate).total_seconds()
-        active = max(0.0, float(rec.value) - basal_rate * seconds / 86400.0)
-        rec.value = f"{active:.3f}"
-    return records
-
-
 def _sync_one_data_type(
     connection: GoogleHealthConnection,
     client: GoogleHealthClient,
@@ -867,7 +859,6 @@ def _sync_one_data_type(
     start: datetime,
     end: datetime,
     resolution_minutes: int | None,
-    basal_rate: float | None,
     result: SyncResult,
 ) -> list[RecordInput]:
     """Fetch, map and ingest a single data type.
@@ -896,8 +887,6 @@ def _sync_one_data_type(
             for rec in (_rollup_to_record(data_type, p) for p in rollup_points)
             if rec is not None
         ]
-        if data_type == DATA_TYPE_TOTAL_CALORIES and basal_rate is not None:
-            records = _totals_to_active_energy(records, basal_rate)
         ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
         result.counts[data_type] = len(records)
         return records
@@ -965,7 +954,6 @@ def sync_user(
     resolution_minutes: int | None = None,
     client: GoogleHealthClient | None = None,
     compute_basal: bool = True,
-    basal_rate: float | None = None,
     collect_records: bool = False,
 ) -> SyncResult:
     """Fetch + ingest all configured data types for ``connection`` over [start, end].
@@ -975,16 +963,14 @@ def sync_user(
     after the main ingest so a daily ``BASAL_CALORIES`` series is available
     for downstream MET calculations.
 
-    ``basal_rate`` (kcal/day): when set, ``total-calories`` rollup windows are
-    converted to ACTIVE energy before ingest — each window's pro-rata basal
-    share is subtracted and the result floored at 0. Rationale: the API's only
-    energy series is ``total-calories`` (all candidate active/basal type names
-    were probed and rejected on 2026-07-30), but the stored record type is
-    ``HKQuantityTypeIdentifierActiveEnergyBurned``, whose Apple/HealthKit
-    semantics — and the rewards engine's MET math built on them — require
-    basal-EXCLUDED energy. Left unset, raw totals are stored and a sedentary
-    interval scores MET≈2 downstream. Callers should pass their best estimate
-    of the customer's daily basal rate.
+    Active energy comes straight from Google's ``active-energy-burned`` series
+    (in :data:`DEFAULT_DATA_TYPES`), which is already basal-excluded per
+    Apple/HealthKit ActiveEnergyBurned semantics. Earlier releases (< 0.9.0)
+    reconstructed it as ``total-calories`` rollups minus a caller-supplied
+    ``basal_rate``; that parameter — and total-calories ingestion entirely —
+    were removed once Google shipped the real series (live 2026-08-07), since
+    a week of side-by-side daily rollups showed the reconstruction
+    overestimating active energy by ~430–800 kcal/day.
 
     Failure isolation: one data type failing (bad filter, schema drift, a
     transient error on one endpoint) does not abort the others — the failure
@@ -1015,8 +1001,8 @@ def sync_user(
       rollup window becomes one Record. Data types that don't support
       rollUp (sleep, exercise, height, daily-*) fall back to native.
 
-    With a resolution set, ``total-calories`` and ``floors`` become usable
-    (the ``list`` endpoint rejects them; ``rollUp`` is their only option).
+    With a resolution set, ``floors`` becomes usable (the ``list`` endpoint
+    rejects it; ``rollUp`` is its only option).
     """
     if resolution_minutes is not None and resolution_minutes <= 0:
         raise ValueError("resolution_minutes must be positive or None")
@@ -1043,7 +1029,6 @@ def sync_user(
                     start=start,
                     end=end,
                     resolution_minutes=resolution_minutes,
-                    basal_rate=basal_rate,
                     result=result,
                 )
                 if collect_records:

@@ -1,0 +1,40 @@
+{
+  "dataSource": {
+    "recordingMethod": "DERIVED",
+    "device": {
+      "displayName": "Charge 5"
+    },
+    "platform": "FITBIT"
+  },
+  "activeEnergyBurned": {
+    "interval": {
+      "startTime": "2026-08-07T15:04:00Z",
+      "startUtcOffset": "-14400s",
+      "endTime": "2026-08-07T15:05:00Z",
+      "endUtcOffset": "-14400s",
+      "civilStartTime": {
+        "date": {
+          "year": 2026,
+          "month": 8,
+          "day": 7
+        },
+        "time": {
+          "hours": 11,
+          "minutes": 4
+        }
+      },
+      "civilEndTime": {
+        "date": {
+          "year": 2026,
+          "month": 8,
+          "day": 7
+        },
+        "time": {
+          "hours": 11,
+          "minutes": 5
+        }
+      }
+    },
+    "kcal": 0.7933980000000002
+  }
+}

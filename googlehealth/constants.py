@@ -64,7 +64,11 @@ DATA_TYPE_HYDRATION_LOG = "hydration-log"
 DATA_TYPE_OXYGEN_SATURATION = "oxygen-saturation"
 DATA_TYPE_SLEEP = "sleep"
 DATA_TYPE_STEPS = "steps"
-DATA_TYPE_TOTAL_CALORIES = "total-calories"
+# Basal-excluded energy series, shipped by Google ~Aug 2026 (probed and absent
+# 2026-07-30; live with per-minute data 2026-08-07). Supersedes total-calories,
+# which this library no longer syncs: totals include basal burn, and storing
+# them as ACTIVE_CALORIES inflated downstream MET math.
+DATA_TYPE_ACTIVE_ENERGY_BURNED = "active-energy-burned"
 DATA_TYPE_WEIGHT = "weight"
 DATA_TYPE_HEIGHT = "height"
 DATA_TYPE_DAILY_RESTING_HEART_RATE = "daily-resting-heart-rate"
