@@ -384,7 +384,6 @@ dependencies = [
     { name = "google-auth-oauthlib" },
     { name = "httpx" },
     { name = "pydantic" },
-    { name = "python-dateutil" },
 ]
 
 [package.dev-dependencies]
@@ -406,7 +405,6 @@ requires-dist = [
     { name = "google-auth-oauthlib", specifier = ">=1.2" },
     { name = "httpx" },
     { name = "pydantic", specifier = ">=2" },
-    { name = "python-dateutil" },
 ]
 
 [package.metadata.requires-dev]

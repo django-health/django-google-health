@@ -14,10 +14,11 @@ Caveats — Google Health's data model isn't 1:1 with Apple HealthKit (which is 
 
 * Energy: ``active-energy-burned`` (basal-excluded, live since ~Aug 2026) maps
   to ``ActivityMetric.ACTIVE_CALORIES``. ``total-calories`` is deliberately not
-  synced — totals include basal burn, and storing them as ACTIVE inflates
-  downstream MET math. ``basal-energy-burned`` exists in the API schema but
-  returns no data for Fitbit accounts (probed 2026-08-07), so the daily
-  ``BASAL_CALORIES`` series still comes from :func:`compute_basal_calories`.
+  ingested — totals include basal burn, and storing them as ACTIVE inflates
+  downstream MET math — but its rollups feed :func:`compute_basal_calories`,
+  which derives the daily ``BASAL_CALORIES`` series as total − active.
+  (``basal-energy-burned`` exists in the API schema but returns no data for
+  Fitbit accounts, probed 2026-08-07.)
 * ``HKAltitudeGain`` is a non-standard identifier — Apple HealthKit doesn't have
   a direct analog for cumulative elevation gain over an interval.
 
@@ -32,11 +33,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
-import dateutil.parser
-from healthdatamodel.bmr import age_from_dob, calculate_bmr, get_bmr
 from healthdatamodel.constants import DataSource
 from healthdatamodel.ingest import ingest_records, ingest_workouts
-from healthdatamodel.models import Record
 from healthdatamodel.query import SLEEP_TYPE, ActivityMetric, SleepValue
 from healthdatamodel.schemas import MetadataEntry, RecordInput, WorkoutInput
 
@@ -728,58 +726,10 @@ def _build_filter(data_type: str, start: datetime, end: datetime) -> str | None:
 
 _BASAL_RESULT_KEY = "basal-calories"
 
-
-def _profile_dob_and_gender(profile: dict[str, Any]) -> tuple[date | None, str]:
-    """Best-effort extraction of DOB + gender from Google Health profile payload.
-
-    Google's profile schema isn't fully documented; we try the most common
-    spellings. Returns ``(None, "")`` when either field can't be resolved —
-    callers fall back to the median-table BMR via :func:`get_bmr`.
-    """
-    dob_raw = (
-        profile.get("dateOfBirth")
-        or profile.get("birthday")
-        or profile.get("birthDate")
-    )
-    dob: date | None = None
-    if isinstance(dob_raw, str):
-        try:
-            dob = dateutil.parser.parse(dob_raw).date()
-        except (ValueError, TypeError):
-            dob = None
-    elif isinstance(dob_raw, dict):
-        # Google sometimes uses civil-date {"year": ..., "month": ..., "day": ...}.
-        try:
-            dob = date(int(dob_raw["year"]), int(dob_raw["month"]), int(dob_raw["day"]))
-        except (KeyError, TypeError, ValueError):
-            dob = None
-
-    gender_raw = str(profile.get("gender") or profile.get("sex") or "").upper()
-    if gender_raw.startswith("M"):
-        gender = "M"
-    elif gender_raw.startswith("F"):
-        gender = "F"
-    else:
-        gender = ""
-
-    return dob, gender
-
-
-def _latest_value_at_or_before(customer: Any, hk_type: str, day: date) -> float | None:
-    cutoff = datetime.combine(
-        day + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
-    )
-    record = (
-        Record.objects.filter(customer=customer, type=hk_type, startDate__lt=cutoff)
-        .order_by("-startDate")
-        .first()
-    )
-    if record is None:
-        return None
-    try:
-        return float(record.value)
-    except (TypeError, ValueError):
-        return None
+# Queried rollup-only as an input to compute_basal_calories; deliberately not a
+# public DATA_TYPE_* — totals include basal burn and are never ingested (storing
+# them under an ACTIVE identifier was the pre-0.9.0 stopgap this replaced).
+_TOTAL_CALORIES = "total-calories"
 
 
 def compute_basal_calories(
@@ -787,67 +737,76 @@ def compute_basal_calories(
     *,
     start: datetime,
     end: datetime,
-    profile: dict[str, Any] | None = None,
     client: GoogleHealthClient | None = None,
     admin_create_date: datetime | None = None,
 ) -> int:
-    """Estimate daily BMR for every day in [start, end] and persist as
-    ``ActivityMetric.BASAL_CALORIES`` records.
+    """Derive daily ``BASAL_CALORIES`` as total-calories − active-energy-burned.
 
-    Uses Mifflin-St Jeor (:func:`healthdatamodel.bmr.calculate_bmr`) when
-    height + weight are both available on or before each day, falling back to
-    the median-table lookup (:func:`healthdatamodel.bmr.get_bmr`) when either
-    is missing.
+    Google keeps its own energy ledger: ``total-calories`` (everything burned)
+    minus ``active-energy-burned`` (the basal-excluded series this library
+    ingests as ACTIVE) leaves the day's non-active burn — real per-user data,
+    measured by the same device that produced the other series.
 
-    Pass ``profile`` to skip the HTTP call (handy in tests). If both
-    ``profile`` and ``client`` are ``None``, a transient ``GoogleHealthClient``
-    is built for the profile fetch only.
+    This replaced the pre-0.9.0 profile-based Mifflin/median estimate: the
+    live profile payload carries ``age`` only (no gender, DOB, or height —
+    issue #29), so that path always emitted a flat 2000 kcal default. For
+    profile-supplied BMR math, use ``healthdatamodel.bmr`` directly.
+
+    Days are 86400s rollup windows anchored at ``start``'s UTC midnight. A day
+    with no total-calories window is skipped, not defaulted (device not yet
+    synced); a missing active window counts as 0 (a fully sedentary day).
     """
-    owns_client = False
-    if profile is None:
-        owns_client = client is None
-        if client is None:
-            client = GoogleHealthClient(connection)
-        try:
-            profile = client.get_profile()
-        finally:
-            if owns_client:
-                client.close()
+    owns_client = client is None
+    if client is None:
+        client = GoogleHealthClient(connection)
 
-    dob, gender = _profile_dob_and_gender(profile or {})
-    age = age_from_dob(dob) if dob is not None else None
+    window_start = datetime.combine(
+        start.date(), datetime.min.time(), tzinfo=timezone.utc
+    )
+    window_end = datetime.combine(
+        end.date() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
+    )
 
-    customer = connection.customer
+    def _daily_kcal(
+        data_type: str, block_key: str
+    ) -> dict[datetime, tuple[float, datetime]]:
+        days: dict[datetime, tuple[float, datetime]] = {}
+        for point in client.iter_roll_up(
+            data_type, start=window_start, end=window_end, window_seconds=86400
+        ):
+            block = point.get(block_key)
+            if not isinstance(block, dict) or "kcalSum" not in block:
+                continue
+            p_start = _parse_dt(point["startTime"])
+            days[p_start] = (float(block["kcalSum"]), _parse_dt(point["endTime"]))
+        return days
+
+    try:
+        totals = _daily_kcal(_TOTAL_CALORIES, "totalCalories")
+        actives = _daily_kcal(DATA_TYPE_ACTIVE_ENERGY_BURNED, "activeEnergyBurned")
+    finally:
+        if owns_client:
+            client.close()
+
     creation = admin_create_date or datetime.now(timezone.utc)
     records: list[RecordInput] = []
-    day = start.date()
-    end_day = end.date()
-    while day <= end_day:
-        weight = _latest_value_at_or_before(customer, HK_BODY_MASS, day)
-        height_m = _latest_value_at_or_before(customer, HK_HEIGHT, day)
-
-        if weight is not None and height_m is not None and age is not None and gender:
-            bmr = calculate_bmr(age, gender, weight, height_m * 100.0)
-        else:
-            bmr = get_bmr(age=age, gender=gender)
-
-        day_start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
-        day_end = day_start + timedelta(days=1)
+    for day_start in sorted(totals):
+        total, day_end = totals[day_start]
+        active = actives.get(day_start, (0.0, day_end))[0]
         records.append(
             RecordInput(
-                recordId=f"basal-{day.isoformat()}",
+                recordId=f"basal-{day_start.date().isoformat()}",
                 startDate=day_start,
                 endDate=day_end,
                 creationDate=creation,
                 sourceName=SOURCE_NAME,
                 type=str(ActivityMetric.BASAL_CALORIES),
-                value=str(bmr),
+                value=f"{max(total - active, 0.0):.3f}",
                 unit="kcal",
             )
         )
-        day += timedelta(days=1)
 
-    ingest_records(customer, records, source=DataSource.GOOGLE_HEALTH)
+    ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
     return len(records)
 
 
@@ -981,8 +940,7 @@ def sync_user(
     :attr:`~googlehealth.models.ConnectionStatus.UNLINKED` (the account has no
     Google Health profile — permanent until the user reconnects with the right
     one). ``compute_basal_calories`` is likewise treated as an enrichment: its
-    failure (e.g. a token minted without the profile scope → HTTP 403) is
-    recorded, not raised.
+    failure is recorded, not raised.
 
     ``collect_records=True`` additionally returns the mapped Records on
     ``SyncResult.records``, so callers can compute derived stats from the
@@ -1070,11 +1028,8 @@ def sync_user(
                 result.errors[data_type] = f"{type(exc).__name__}: {exc}"
 
         if compute_basal and connection.status != ConnectionStatus.UNLINKED:
-            # Computed AFTER the main loop so the latest weight/height records
-            # this sync brought in are picked up by _latest_value_at_or_before.
-            # An enrichment, not a prerequisite: a failure here (e.g. a token
-            # minted without the profile scope → 403) must not discard an
-            # otherwise-complete sync.
+            # An enrichment, not a prerequisite: a failure here must not
+            # discard an otherwise-complete sync.
             try:
                 basal_count = compute_basal_calories(
                     connection, start=start, end=end, client=client

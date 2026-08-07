@@ -35,7 +35,6 @@ dependencies = [
     "google-auth-oauthlib>=1.2",
     "httpx",
     "pydantic>=2",
-    "python-dateutil",
 ]
 
 [project.urls]

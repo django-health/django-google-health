@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -661,123 +661,124 @@ def test_sync_user_handles_expired_token(customer):
 # ---------------------------------------------------------------------------
 
 
-def _seed_height_weight(customer, *, height_m: float, weight_kg: float, when: datetime):
-    """Seed Record rows so compute_basal_calories has weight + height to read."""
-    from healthdatamodel.models import Record
-
-    common = {
-        "customer": customer,
-        "startDate": when,
-        "endDate": when,
-        "creationDate": when,
-        "admin_create_date": when,
-        "sourceName": "seed",
-        "source": DataSource.GOOGLE_HEALTH,
+def _rollup_page(block_key: str, windows: list[tuple[str, str, float]]) -> dict:
+    return {
+        "rollupDataPoints": [
+            {"startTime": s, "endTime": e, block_key: {"kcalSum": kcal}}
+            for s, e, kcal in windows
+        ],
+        "nextPageToken": "",
     }
-    Record.objects.create(
-        **common, type=ingest.HK_HEIGHT, value=str(height_m), unit="m"
-    )
-    Record.objects.create(
-        **common, type=ingest.HK_BODY_MASS, value=str(weight_kg), unit="kg"
-    )
-
-
-@pytest.mark.django_db
-def test_compute_basal_calories_uses_mifflin_when_height_weight_available(connection):
-    from healthdatamodel.models import Record
-    from healthdatamodel.query import ActivityMetric
-
-    customer = connection.customer
-    seed_when = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    _seed_height_weight(customer, height_m=1.80, weight_kg=80.0, when=seed_when)
-
-    from healthdatamodel.bmr import age_from_dob, calculate_bmr
-
-    dob = date(1990, 1, 1)
-    profile = {"birthday": dob.isoformat(), "gender": "MALE"}
-    start = datetime(2026, 5, 1, tzinfo=timezone.utc)
-    end = datetime(2026, 5, 3, tzinfo=timezone.utc)
-
-    count = ingest.compute_basal_calories(
-        connection, start=start, end=end, profile=profile
-    )
-
-    assert count == 3  # May 1, 2, 3
-    records = Record.objects.filter(
-        customer=customer, type=str(ActivityMetric.BASAL_CALORIES)
-    ).order_by("startDate")
-    assert records.count() == 3
-    expected = calculate_bmr(age_from_dob(dob), "M", 80.0, 180.0)
-    for rec in records:
-        assert float(rec.value) == pytest.approx(expected, rel=1e-6)
-    assert {r.unit for r in records} == {"kcal"}
-
-
-@pytest.mark.django_db
-def test_compute_basal_calories_falls_back_to_lookup_when_records_missing(connection):
-    from healthdatamodel.models import Record
-    from healthdatamodel.query import ActivityMetric
-
-    profile = {"birthday": "1990-05-15", "gender": "MALE"}
-    count = ingest.compute_basal_calories(
-        connection,
-        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        end=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        profile=profile,
-    )
-    assert count == 1
-    rec = Record.objects.get(
-        customer=connection.customer, type=str(ActivityMetric.BASAL_CALORIES)
-    )
-    # get_bmr's lookup table for a 35yo male yields a positive BMR, not the
-    # 2000 default — we don't pin the exact value (the tables drift over time).
-    assert float(rec.value) > 1000.0
-
-
-@pytest.mark.django_db
-def test_compute_basal_calories_returns_default_when_profile_blank(connection):
-    from healthdatamodel.bmr import DEFAULT_BMR
-    from healthdatamodel.models import Record
-    from healthdatamodel.query import ActivityMetric
-
-    count = ingest.compute_basal_calories(
-        connection,
-        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        end=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        profile={},
-    )
-    assert count == 1
-    rec = Record.objects.get(
-        customer=connection.customer, type=str(ActivityMetric.BASAL_CALORIES)
-    )
-    assert float(rec.value) == DEFAULT_BMR
-
-
-@pytest.mark.django_db
-def test_compute_basal_calories_handles_civil_date_dob(connection):
-    """Google's civil-date {year, month, day} shape should parse like ISO strings."""
-    count = ingest.compute_basal_calories(
-        connection,
-        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        end=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        profile={"birthday": {"year": 1990, "month": 5, "day": 15}, "gender": "FEMALE"},
-    )
-    assert count == 1
 
 
 @respx.mock
-def test_sync_user_with_compute_basal_calls_profile_and_persists(connection):
+def test_compute_basal_calories_derives_total_minus_active(connection):
+    """Basal = Google's own ledger: daily total-calories − active-energy-burned.
+    A day with no total window is skipped (device not synced); a day with no
+    active window counts active as 0."""
+    from healthdatamodel.models import Record
+    from healthdatamodel.query import ActivityMetric
+
+    respx.post(_rollup_url("total-calories")).mock(
+        return_value=Response(
+            200,
+            json=_rollup_page(
+                "totalCalories",
+                [
+                    ("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", 5000.0),
+                    ("2026-05-02T00:00:00Z", "2026-05-03T00:00:00Z", 2000.0),
+                ],
+            ),
+        )
+    )
+    respx.post(_rollup_url("active-energy-burned")).mock(
+        return_value=Response(
+            200,
+            json=_rollup_page(
+                "activeEnergyBurned",
+                [("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", 2900.0)],
+            ),
+        )
+    )
+
+    count = ingest.compute_basal_calories(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        # Window covers May 1-3; May 3 has no total window -> skipped.
+        end=datetime(2026, 5, 3, tzinfo=timezone.utc),
+    )
+
+    assert count == 2
+    records = Record.objects.filter(
+        customer=connection.customer, type=str(ActivityMetric.BASAL_CALORIES)
+    ).order_by("startDate")
+    assert [r.value for r in records] == ["2100.000", "2000.000"]
+    assert records[0].startDate == datetime(2026, 5, 1, tzinfo=timezone.utc)
+    assert records[0].endDate == datetime(2026, 5, 2, tzinfo=timezone.utc)
+    assert {r.unit for r in records} == {"kcal"}
+
+
+@respx.mock
+def test_compute_basal_calories_floors_at_zero(connection):
+    """active > total (clock skew / partial windows) must not go negative."""
+    from healthdatamodel.models import Record
+    from healthdatamodel.query import ActivityMetric
+
+    windows = [("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", 100.0)]
+    respx.post(_rollup_url("total-calories")).mock(
+        return_value=Response(200, json=_rollup_page("totalCalories", windows))
+    )
+    respx.post(_rollup_url("active-energy-burned")).mock(
+        return_value=Response(
+            200,
+            json=_rollup_page(
+                "activeEnergyBurned",
+                [("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", 150.0)],
+            ),
+        )
+    )
+
+    ingest.compute_basal_calories(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 1, tzinfo=timezone.utc),
+    )
+    rec = Record.objects.get(
+        customer=connection.customer, type=str(ActivityMetric.BASAL_CALORIES)
+    )
+    assert rec.value == "0.000"
+
+
+@respx.mock
+def test_sync_user_with_compute_basal_derives_and_persists(connection):
     """Wired through sync_user: the basal step runs after the main loop."""
     from healthdatamodel.models import Record
     from healthdatamodel.query import ActivityMetric
 
-    customer = connection.customer
-    seed_when = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    _seed_height_weight(customer, height_m=1.65, weight_kg=60.0, when=seed_when)
-
     respx.get(_dp_url(DATA_TYPE_STEPS)).mock(return_value=Response(200, json=_page([])))
-    respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/profile").mock(
-        return_value=Response(200, json={"birthday": "1995-01-01", "gender": "F"})
+    respx.post(_rollup_url("total-calories")).mock(
+        return_value=Response(
+            200,
+            json=_rollup_page(
+                "totalCalories",
+                [
+                    ("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", 4000.0),
+                    ("2026-05-02T00:00:00Z", "2026-05-03T00:00:00Z", 3000.0),
+                ],
+            ),
+        )
+    )
+    respx.post(_rollup_url("active-energy-burned")).mock(
+        return_value=Response(
+            200,
+            json=_rollup_page(
+                "activeEnergyBurned",
+                [
+                    ("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", 1500.0),
+                    ("2026-05-02T00:00:00Z", "2026-05-03T00:00:00Z", 500.0),
+                ],
+            ),
+        )
     )
 
     result = ingest.sync_user(
@@ -789,13 +790,11 @@ def test_sync_user_with_compute_basal_calls_profile_and_persists(connection):
     )
 
     assert result.counts[DATA_TYPE_STEPS] == 0
-    assert result.counts["basal-calories"] == 2  # 2026-05-01, 2026-05-02
-    assert (
-        Record.objects.filter(
-            customer=customer, type=str(ActivityMetric.BASAL_CALORIES)
-        ).count()
-        == 2
-    )
+    assert result.counts["basal-calories"] == 2
+    records = Record.objects.filter(
+        customer=connection.customer, type=str(ActivityMetric.BASAL_CALORIES)
+    ).order_by("startDate")
+    assert [r.value for r in records] == ["2500.000", "2500.000"]
 
 
 def _rollup_url(data_type: str) -> str:
@@ -1155,10 +1154,10 @@ def test_sync_user_isolates_per_type_failures(connection, customer):
 
 @respx.mock
 def test_sync_user_compute_basal_failure_recorded_not_raised(connection, customer):
-    """compute_basal is an enrichment: a profile 403 (token minted without the
-    profile scope) must not discard an otherwise-complete sync."""
+    """compute_basal is an enrichment: a failing rollup fetch must not
+    discard an otherwise-complete sync."""
     respx.get(_dp_url(DATA_TYPE_STEPS)).mock(return_value=Response(200, json=_page([])))
-    respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/profile").mock(
+    respx.post(_rollup_url("total-calories")).mock(
         return_value=Response(403, json={"error": {"message": "insufficient scopes"}})
     )
 
