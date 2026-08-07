@@ -323,6 +323,26 @@ class TestMobileCallback:
         resp = Client().get(CALLBACK_URL, {"code": "abc", "state": "teststate123"})
         assert "reason=ingest_failed" in resp["Location"]
 
+    @patch(
+        "googlehealth.oauth._fetch_google_user_id",
+        side_effect=oauth.AccountNotLinkedError("HTTP 400: not linked"),
+    )
+    @patch("googlehealth.oauth.exchange_code")
+    def test_unlinked_account_rolls_back_and_reports_reason(
+        self, mock_exchange, _fetch, customer
+    ):
+        """An account with no Fitbit profile (real 400 captured 2026-08-07)
+        yields a permanently dead connection — per this view's contract
+        (status=error ⇒ no row), roll back and tell the app why."""
+        mock_exchange.return_value = GoogleTokens(
+            access_token="tok", expires_in=3600, refresh_token="ref", scope=""
+        )
+        _make_state(customer)
+        resp = Client().get(CALLBACK_URL, {"code": "abc", "state": "teststate123"})
+        assert "status=error" in resp["Location"]
+        assert "reason=account_not_linked" in resp["Location"]
+        assert not GoogleHealthConnection.objects.filter(customer=customer).exists()
+
     @patch("googlehealth.oauth._fetch_google_user_id", return_value="guser1")
     @patch("googlehealth.oauth.exchange_code")
     def test_receiver_db_writes_roll_back_with_the_connection(

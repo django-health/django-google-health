@@ -1,4 +1,6 @@
+import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from django.contrib.auth import get_user_model
@@ -26,3 +28,11 @@ def connection(customer):
         token_expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
         scopes=[SCOPE_ACTIVITY_AND_FITNESS_READONLY, SCOPE_SLEEP_READONLY],
     )
+
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def load_fixture(name: str) -> dict:
+    """Real payloads captured from the live API — ground truth for shapes."""
+    return json.loads((FIXTURES_DIR / name).read_text())

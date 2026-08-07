@@ -32,7 +32,7 @@ from django.views.decorators.http import require_http_methods, require_POST
 
 from . import oauth, webhooks
 from .constants import DEFAULT_SCOPES
-from .models import GoogleHealthConnection, consume
+from .models import ConnectionStatus, GoogleHealthConnection, consume
 from .signals import mobile_connected, notification_received
 
 log = logging.getLogger(__name__)
@@ -208,6 +208,13 @@ def mobile_callback(request: HttpRequest) -> HttpResponse:
                 connection = oauth.ingest_tokens(customer=rec.customer, tokens=tokens)
             except Exception as exc:
                 raise _MobileCallbackError("ingest_failed") from exc
+
+            if connection.status == ConnectionStatus.UNLINKED:
+                # The Google account has no Fitbit profile — a permanently
+                # dead connection. Per this view's contract (status=error ⇒
+                # no connection row), roll it back and tell the app why so it
+                # can prompt for the right account.
+                raise _MobileCallbackError("account_not_linked")
 
             try:
                 mobile_connected.send(

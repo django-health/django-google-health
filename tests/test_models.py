@@ -25,4 +25,4 @@ def test_create_connection(customer):
 
 def test_status_choices_include_disconnected_and_revoked():
     values = {c.value for c in ConnectionStatus}
-    assert values == {"active", "disconnected", "revoked"}
+    assert values == {"active", "disconnected", "revoked", "unlinked"}

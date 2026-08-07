@@ -265,3 +265,25 @@ def test_list_exercises_against_real_api(db):
         page = client.list_data_points(DATA_TYPE_EXERCISE, page_size=5)
 
     assert "dataPoints" in page
+
+
+# google.rpc.ErrorInfo reason extraction ---------------------------------------
+
+
+def test_api_error_reason_from_real_error_body():
+    """Real ACCOUNT_NOT_LINKED body captured 2026-08-07 from an enterprise
+    Google account with no Fitbit profile."""
+    from tests.conftest import load_fixture
+
+    err = GoogleHealthAPIError(
+        400,
+        "The account is not linked to Google Health.",
+        load_fixture("error_account_not_linked.json"),
+    )
+    assert err.reason == "ACCOUNT_NOT_LINKED"
+
+
+def test_api_error_reason_empty_when_absent():
+    assert GoogleHealthAPIError(500, "boom", None).reason == ""
+    assert GoogleHealthAPIError(400, "x", {"error": {"code": 400}}).reason == ""
+    assert GoogleHealthAPIError(400, "x", "not json").reason == ""

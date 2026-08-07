@@ -9,6 +9,11 @@ class ConnectionStatus(models.TextChoices):
     ACTIVE = "active", "Active"
     DISCONNECTED = "disconnected", "Disconnected"
     REVOKED = "revoked", "Revoked"
+    # OAuth succeeded but the Google account has no Google Health (Fitbit)
+    # profile — every API call returns 400 ACCOUNT_NOT_LINKED. Permanent for
+    # this account (post-migration there is no "link later" journey); the fix
+    # is reconnecting with the right account.
+    UNLINKED = "unlinked", "Not linked to Google Health"
 
 
 class GoogleHealthConnection(models.Model):

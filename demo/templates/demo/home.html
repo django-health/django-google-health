@@ -91,6 +91,20 @@
         <button type="submit" style="background:#fff;color:#a00;border-color:#a00">Disconnect</button>
       </form>
     </div>
+  {% elif connection and connection.status == 'unlinked' %}
+    <div class="row disconnected">
+      <div>
+        <strong>This Google account isn't linked to Google Health.</strong><br />
+        <small>
+          The account you authorized has no Fitbit profile, so every sync will
+          fail. Reconnect with the Google account that holds your Fitbit data —
+          or <a href="https://fitbit.google.com/auth/signup">create a profile</a>
+          for this one first. (Enterprise/Workspace accounts generally can't
+          hold Fitbit profiles.)
+        </small>
+      </div>
+      <a class="button" href="{% url 'googlehealth:connect' %}">Reconnect</a>
+    </div>
   {% else %}
     <div class="row disconnected">
       <div>
