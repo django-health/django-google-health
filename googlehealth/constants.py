@@ -73,3 +73,10 @@ DATA_TYPE_DAILY_OXYGEN_SATURATION = "daily-oxygen-saturation"
 # Human-readable, stored in Record.sourceName. The machine identifier is
 # ``healthdatamodel.constants.DataSource.GOOGLE_HEALTH`` (added in 0.4.0).
 SOURCE_NAME = "Google Health"
+
+# google.rpc.ErrorInfo reason returned (HTTP 400 FAILED_PRECONDITION) by every
+# endpoint when the OAuth'd Google account has no Google Health (Fitbit)
+# profile. Captured live 2026-08-07 from enterprise accounts; the error's
+# metadata carries this signup redirect for the user to link an account.
+ERROR_REASON_ACCOUNT_NOT_LINKED = "ACCOUNT_NOT_LINKED"
+ACCOUNT_LINK_SIGNUP_URL = "https://fitbit.google.com/auth/signup"

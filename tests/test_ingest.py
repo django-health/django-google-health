@@ -1368,3 +1368,65 @@ def test_collect_records_is_window_bounded(connection, customer):
     assert result.records[0].startDate == datetime(
         2026, 5, 1, 3, 0, tzinfo=timezone.utc
     )
+
+
+# ACCOUNT_NOT_LINKED short-circuit (#26) --------------------------------------
+
+
+@respx.mock
+def test_sync_user_marks_connection_unlinked_and_aborts(connection):
+    """Real error body captured 2026-08-07: an account with no Fitbit profile
+    fails every endpoint identically, so the first ACCOUNT_NOT_LINKED aborts
+    the sweep, marks the connection, and skips basal computation."""
+    from googlehealth.models import ConnectionStatus
+    from tests.conftest import load_fixture
+
+    error_body = load_fixture("error_account_not_linked.json")
+    steps_route = respx.get(_dp_url(DATA_TYPE_STEPS)).mock(
+        return_value=Response(400, json=error_body)
+    )
+    hr_route = respx.get(_dp_url(DATA_TYPE_HEART_RATE)).mock(
+        return_value=Response(400, json=error_body)
+    )
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_STEPS, DATA_TYPE_HEART_RATE],
+        compute_basal=True,
+    )
+
+    assert steps_route.called
+    assert not hr_route.called  # aborted after the first unlinked failure
+    assert "GoogleHealthAPIError" in result.errors[DATA_TYPE_STEPS]
+    assert DATA_TYPE_HEART_RATE not in result.errors
+    assert ingest._BASAL_RESULT_KEY not in result.errors  # basal skipped, not failed
+    connection.refresh_from_db()
+    assert connection.status == ConnectionStatus.UNLINKED
+
+
+@respx.mock
+def test_sync_user_other_api_errors_do_not_unlink(connection):
+    """A plain 400 without ACCOUNT_NOT_LINKED keeps per-type isolation."""
+    from googlehealth.models import ConnectionStatus
+
+    respx.get(_dp_url(DATA_TYPE_STEPS)).mock(
+        return_value=Response(400, json={"error": {"code": 400, "message": "bad"}})
+    )
+    hr_route = respx.get(_dp_url(DATA_TYPE_HEART_RATE)).mock(
+        return_value=Response(200, json=_page([]))
+    )
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_STEPS, DATA_TYPE_HEART_RATE],
+        compute_basal=False,
+    )
+
+    assert hr_route.called  # sweep continued
+    assert DATA_TYPE_STEPS in result.errors
+    connection.refresh_from_db()
+    assert connection.status == ConnectionStatus.ACTIVE

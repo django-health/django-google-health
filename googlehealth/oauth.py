@@ -42,6 +42,7 @@ from .constants import (
     API_BASE_URL,
     API_VERSION,
     DEFAULT_SCOPES,
+    ERROR_REASON_ACCOUNT_NOT_LINKED,
     OAUTH_AUTHORIZATION_URL,
     OAUTH_REVOKE_URL,
     OAUTH_TOKEN_URL,
@@ -65,6 +66,36 @@ class OAuthError(Exception):
 
 class StateMismatchError(OAuthError):
     """Raised when the ``state`` returned from Google doesn't match what we stashed."""
+
+
+class AccountNotLinkedError(OAuthError):
+    """The OAuth'd Google account has no Google Health (Fitbit) profile.
+
+    Permanent for this account: OAuth consent succeeds, but every API call
+    returns 400 ``ACCOUNT_NOT_LINKED``. The fix is user action — reconnect
+    with the Google account that holds the Fitbit profile (or create one via
+    ``ACCOUNT_LINK_SIGNUP_URL``).
+    """
+
+
+def error_reason(payload: Any) -> str:
+    """Extract the ``google.rpc.ErrorInfo`` reason from a Google error body.
+
+    Google attaches machine-readable reasons (e.g. ``ACCOUNT_NOT_LINKED``) as
+    a typed entry in ``error.details``. Returns ``""`` when the payload has no
+    such entry — including non-dict payloads from non-JSON error responses.
+    Lives here rather than ``client`` so both the OAuth flow and the API
+    client can use it (``client`` imports this module, not vice versa).
+    """
+    if not isinstance(payload, dict):
+        return ""
+    details = payload.get("error", {}).get("details") or []
+    for detail in details:
+        if isinstance(detail, dict) and detail.get("@type", "").endswith(
+            "google.rpc.ErrorInfo"
+        ):
+            return str(detail.get("reason", ""))
+    return ""
 
 
 DEFAULT_HTTP_TIMEOUT = 10.0
@@ -296,13 +327,26 @@ def ingest_tokens(
         if isinstance(tokens, GoogleTokens)
         else GoogleTokens.model_validate(tokens)
     )
+    status = ConnectionStatus.ACTIVE
     if google_user_id is None:
         try:
             google_user_id = _fetch_google_user_id(parsed.access_token)
+        except AccountNotLinkedError as exc:
+            # This Google account has no Fitbit profile — permanent for the
+            # account, so record it as a distinct status the consumer can
+            # surface ("reconnect with the right account"). Tokens are still
+            # stored: a reconnect with the proper account overwrites the row.
+            log.warning(
+                "users.getIdentity: account not linked (%s) — marking connection "
+                "unlinked",
+                exc,
+            )
+            google_user_id = ""
+            status = ConnectionStatus.UNLINKED
         except (httpx.HTTPError, OAuthError) as exc:
-            # The OAuth flow itself succeeded; identity is only needed for webhook
-            # routing. Store empty and let a later step resolve it (e.g. a manual
-            # call to _fetch_google_user_id once the API issue is sorted).
+            # Transient failure (network, 5xx): the OAuth flow itself
+            # succeeded and identity is only needed for webhook routing.
+            # Store empty and let a later step resolve it.
             log.warning(
                 "users.getIdentity failed (%s) — storing empty google_user_id", exc
             )
@@ -317,7 +361,7 @@ def ingest_tokens(
             "refresh_token": parsed.refresh_token or "",
             "token_expires_at": parsed.expires_at(now=now),
             "scopes": parsed.scopes,
-            "status": ConnectionStatus.ACTIVE,
+            "status": status,
         },
     )
     return connection
@@ -426,6 +470,15 @@ def _fetch_google_user_id(access_token: str) -> str:
         timeout=_http_timeout(),
     )
     if response.status_code >= 400:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if error_reason(payload) == ERROR_REASON_ACCOUNT_NOT_LINKED:
+            raise AccountNotLinkedError(
+                f"users.getIdentity returned HTTP {response.status_code}: "
+                f"{response.text}"
+            )
         # raise_for_status drops the response body; we want it visible.
         raise OAuthError(
             f"users.getIdentity returned HTTP {response.status_code}: {response.text}"

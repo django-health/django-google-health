@@ -331,3 +331,66 @@ def test_refresh_against_real_google(db):
     assert refreshed.token_expires_at > datetime.now(timezone.utc) + timedelta(
         minutes=50
     )
+
+
+# ACCOUNT_NOT_LINKED handling (#26) -------------------------------------------
+# Real error body captured 2026-08-07 from enterprise Google accounts that
+# cannot hold Fitbit profiles: OAuth consent succeeds, every API call 400s.
+
+
+def _unlinked_body():
+    from tests.conftest import load_fixture
+
+    return load_fixture("error_account_not_linked.json")
+
+
+def _tokens():
+    return GoogleTokens(
+        access_token="ya29.x",
+        expires_in=3600,
+        refresh_token="1//y",
+        scope=" ".join(SCOPES),
+    )
+
+
+@respx.mock
+def test_ingest_tokens_marks_unlinked_account(customer):
+    respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/identity").mock(
+        return_value=Response(400, json=_unlinked_body())
+    )
+
+    conn = oauth.ingest_tokens(customer=customer, tokens=_tokens())
+
+    assert conn.status == ConnectionStatus.UNLINKED
+    assert conn.google_user_id == ""
+    # Tokens are still stored — a reconnect with the right account overwrites.
+    assert conn.access_token == "ya29.x"
+
+
+@respx.mock
+def test_ingest_tokens_transient_identity_failure_stays_active(customer):
+    """A 500 (or network error) is not evidence of an unlinked account —
+    keep today's behavior: active with an empty google_user_id."""
+    respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/identity").mock(
+        return_value=Response(500, json={"error": {"code": 500}})
+    )
+
+    conn = oauth.ingest_tokens(customer=customer, tokens=_tokens())
+
+    assert conn.status == ConnectionStatus.ACTIVE
+    assert conn.google_user_id == ""
+
+
+@respx.mock
+def test_ingest_tokens_reconnect_after_unlinked_restores_active(customer):
+    identity = respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/identity")
+    identity.mock(return_value=Response(400, json=_unlinked_body()))
+    conn = oauth.ingest_tokens(customer=customer, tokens=_tokens())
+    assert conn.status == ConnectionStatus.UNLINKED
+
+    identity.mock(return_value=Response(200, json={"googleUserId": "right-account"}))
+    conn = oauth.ingest_tokens(customer=customer, tokens=_tokens())
+
+    assert conn.status == ConnectionStatus.ACTIVE
+    assert conn.google_user_id == "right-account"
+    assert GoogleHealthConnection.objects.count() == 1

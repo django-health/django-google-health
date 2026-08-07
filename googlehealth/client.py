@@ -61,6 +61,11 @@ class GoogleHealthAPIError(Exception):
         self.status_code = status_code
         self.payload = payload
 
+    @property
+    def reason(self) -> str:
+        """The ``google.rpc.ErrorInfo`` reason, or ``""`` if absent."""
+        return oauth.error_reason(self.payload)
+
 
 class GoogleHealthClient:
     """Thin REST client. Use as a context manager so the underlying httpx

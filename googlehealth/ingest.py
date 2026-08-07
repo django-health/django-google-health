@@ -38,7 +38,7 @@ from healthdatamodel.models import Record
 from healthdatamodel.query import SLEEP_TYPE, ActivityMetric, SleepValue
 from healthdatamodel.schemas import MetadataEntry, RecordInput, WorkoutInput
 
-from .client import GoogleHealthClient
+from .client import GoogleHealthAPIError, GoogleHealthClient
 from .constants import (
     DATA_TYPE_ACTIVE_ZONE_MINUTES,
     DATA_TYPE_ALTITUDE,
@@ -54,8 +54,10 @@ from .constants import (
     DATA_TYPE_STEPS,
     DATA_TYPE_TOTAL_CALORIES,
     DATA_TYPE_WEIGHT,
+    ERROR_REASON_ACCOUNT_NOT_LINKED,
     SOURCE_NAME,
 )
+from .models import ConnectionStatus
 from .oauth import OAuthError
 
 if TYPE_CHECKING:
@@ -988,9 +990,13 @@ def sync_user(
     transient error on one endpoint) does not abort the others — the failure
     is recorded in ``SyncResult.errors`` and the sync continues. Credential
     problems (:class:`OAuthError`) still abort the whole sync, since they
-    would fail every subsequent request anyway. ``compute_basal_calories`` is
-    likewise treated as an enrichment: its failure (e.g. a token minted
-    without the profile scope → HTTP 403) is recorded, not raised.
+    would fail every subsequent request anyway; likewise an
+    ``ACCOUNT_NOT_LINKED`` API error stops the sweep and marks the connection
+    :attr:`~googlehealth.models.ConnectionStatus.UNLINKED` (the account has no
+    Google Health profile — permanent until the user reconnects with the right
+    one). ``compute_basal_calories`` is likewise treated as an enrichment: its
+    failure (e.g. a token minted without the profile scope → HTTP 403) is
+    recorded, not raised.
 
     ``collect_records=True`` additionally returns the mapped Records on
     ``SyncResult.records``, so callers can compute derived stats from the
@@ -1046,6 +1052,28 @@ def sync_user(
                 # A credential problem fails every subsequent request too —
                 # no point grinding through the remaining types.
                 raise
+            except GoogleHealthAPIError as exc:
+                result.errors[data_type] = f"{type(exc).__name__}: {exc}"
+                if exc.reason == ERROR_REASON_ACCOUNT_NOT_LINKED:
+                    # The Google account has no Fitbit profile: every remaining
+                    # type (and basal) would fail identically. Mark the
+                    # connection so consumers can surface "reconnect with the
+                    # right account", and stop here.
+                    connection.status = ConnectionStatus.UNLINKED
+                    connection.save(update_fields=["status"])
+                    logger.warning(
+                        "googlehealth sync: connection %s is not linked to "
+                        "Google Health — marked unlinked, aborting sync",
+                        connection.pk,
+                    )
+                    break
+                logger.warning(
+                    "googlehealth sync: %s failed for connection %s: %s: %s",
+                    data_type,
+                    connection.pk,
+                    type(exc).__name__,
+                    exc,
+                )
             except Exception as exc:  # noqa: BLE001 - isolate per-type failures
                 logger.warning(
                     "googlehealth sync: %s failed for connection %s: %s: %s",
@@ -1056,7 +1084,7 @@ def sync_user(
                 )
                 result.errors[data_type] = f"{type(exc).__name__}: {exc}"
 
-        if compute_basal:
+        if compute_basal and connection.status != ConnectionStatus.UNLINKED:
             # Computed AFTER the main loop so the latest weight/height records
             # this sync brought in are picked up by _latest_value_at_or_before.
             # An enrichment, not a prerequisite: a failure here (e.g. a token
