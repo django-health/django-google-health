@@ -941,6 +941,51 @@ def test_sync_user_against_real_api(db):
     assert DATA_TYPE_STEPS in result.counts
 
 
+@pytest.mark.live
+def test_basal_energy_burned_watchdog(db):
+    """Fails the day Google starts populating basal-energy-burned.
+
+    The type is officially the true BMR series (Fitbit ``caloriesBMR`` per
+    the migration mapping table), but as of 2026-08-07 it supports only
+    ``list``/``reconcile`` and returns zero points for Fitbit accounts —
+    which is why ``compute_basal_calories`` derives basal as total − active
+    instead. If this test fails, real measured BMR data has arrived: switch
+    the derivation to the measured series (see compute_basal_calories's
+    docstring) and retire this watchdog.
+    """
+    refresh_token = os.getenv("GOOGLE_HEALTH_TEST_REFRESH_TOKEN")
+    client_id = os.getenv("GOOGLE_HEALTH_TEST_CLIENT_ID")
+    client_secret = os.getenv("GOOGLE_HEALTH_TEST_CLIENT_SECRET")
+    if not (refresh_token and client_id and client_secret):
+        pytest.skip("set GOOGLE_HEALTH_TEST_* env vars to enable")
+
+    from django.conf import settings
+    from django.contrib.auth import get_user_model
+
+    settings.GOOGLE_HEALTH_CLIENT_ID = client_id
+    settings.GOOGLE_HEALTH_CLIENT_SECRET = client_secret
+
+    User = get_user_model()
+    customer = User.objects.create_user(username="live-basal-watchdog")
+    conn = GoogleHealthConnection.objects.create(
+        customer=customer,
+        google_user_id="placeholder",
+        access_token="placeholder",
+        refresh_token=refresh_token,
+        token_expires_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        scopes=[SCOPE_ACTIVITY_AND_FITNESS_READONLY],
+    )
+    oauth.refresh_access_token(conn)
+    with GoogleHealthClient(conn) as client:
+        points = list(client.iter_data_points("basal-energy-burned"))
+
+    assert points == [], (
+        "basal-energy-burned now returns data! Google shipped the measured "
+        "BMR series — switch compute_basal_calories from the total − active "
+        f"derivation to it. First point: {points[0] if points else None}"
+    )
+
+
 # Server-side filters, failure isolation, active-energy conversion ------------
 # (all behaviors verified against the live API on 2026-07-30)
 
