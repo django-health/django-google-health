@@ -104,7 +104,7 @@ def test_proactive_refresh_when_token_expired(customer, no_sleep):
         )
     )
     route = respx.get(IDENTITY_URL).mock(
-        return_value=Response(200, json={"googleUserId": "g1"})
+        return_value=Response(200, json={"healthUserId": "g1"})
     )
 
     with GoogleHealthClient(conn, sleep=no_sleep) as client:
@@ -131,14 +131,14 @@ def test_401_triggers_refresh_and_single_retry(connection, no_sleep):
     respx.get(IDENTITY_URL).mock(
         side_effect=[
             Response(401, json={"error": {"message": "invalid_token"}}),
-            Response(200, json={"googleUserId": "g1"}),
+            Response(200, json={"healthUserId": "g1"}),
         ]
     )
 
     with GoogleHealthClient(connection, sleep=no_sleep) as client:
         result = client.get_identity()
 
-    assert result == {"googleUserId": "g1"}
+    assert result == {"healthUserId": "g1"}
     connection.refresh_from_db()
     assert connection.access_token == "ya29.fresh"
 
@@ -175,7 +175,7 @@ def test_429_retries_then_succeeds(connection):
     respx.get(IDENTITY_URL).mock(
         side_effect=[
             Response(429, headers={"Retry-After": "2"}, json={}),
-            Response(200, json={"googleUserId": "g1"}),
+            Response(200, json={"healthUserId": "g1"}),
         ]
     )
 

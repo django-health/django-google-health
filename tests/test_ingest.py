@@ -58,7 +58,7 @@ def test_map_steps():
                 "startTime": "2026-05-01T10:00:00Z",
                 "endTime": "2026-05-01T10:15:00Z",
             },
-            "stepCount": "1234",
+            "count": "1234",
             "updateTime": "2026-05-01T10:20:00Z",
         },
     }
@@ -89,7 +89,7 @@ def test_map_heart_rate_point_in_time():
     dp = {
         "name": "users/x/dataTypes/heart-rate/dataPoints/h1",
         "heartRate": {
-            "time": "2026-05-01T10:00:00Z",
+            "sampleTime": {"physicalTime": "2026-05-01T10:00:00Z"},
             "beatsPerMinute": 72,
             "updateTime": "2026-05-01T10:00:01Z",
         },
@@ -104,8 +104,8 @@ def test_map_weight():
     dp = {
         "name": "users/x/dataTypes/weight/dataPoints/w1",
         "weight": {
-            "time": "2026-05-01T08:00:00Z",
-            "weightKg": 75.4,
+            "sampleTime": {"physicalTime": "2026-05-01T08:00:00Z"},
+            "weightGrams": 75400,
             "updateTime": "2026-05-01T08:00:01Z",
         },
     }
@@ -140,39 +140,29 @@ def test_map_sleep_session_decomposes_stages():
             },
             "stages": [
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T03:00:00Z",
-                        "endTime": "2026-05-01T04:00:00Z",
-                    },
-                    "stage": "LIGHT",
+                    "startTime": "2026-05-01T03:00:00Z",
+                    "endTime": "2026-05-01T04:00:00Z",
+                    "type": "LIGHT",
                 },
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T04:00:00Z",
-                        "endTime": "2026-05-01T05:30:00Z",
-                    },
-                    "stage": "DEEP",
+                    "startTime": "2026-05-01T04:00:00Z",
+                    "endTime": "2026-05-01T05:30:00Z",
+                    "type": "DEEP",
                 },
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T05:30:00Z",
-                        "endTime": "2026-05-01T06:30:00Z",
-                    },
-                    "stage": "REM",
+                    "startTime": "2026-05-01T05:30:00Z",
+                    "endTime": "2026-05-01T06:30:00Z",
+                    "type": "REM",
                 },
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T06:30:00Z",
-                        "endTime": "2026-05-01T07:00:00Z",
-                    },
-                    "stage": "AWAKE",
+                    "startTime": "2026-05-01T06:30:00Z",
+                    "endTime": "2026-05-01T07:00:00Z",
+                    "type": "AWAKE",
                 },
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T07:00:00Z",
-                        "endTime": "2026-05-01T07:01:00Z",
-                    },
-                    "stage": "WEIRD_NEW_STAGE",  # unknown stages are skipped
+                    "startTime": "2026-05-01T07:00:00Z",
+                    "endTime": "2026-05-01T07:01:00Z",
+                    "type": "WEIRD_NEW_STAGE",  # unknown stages are skipped
                 },
             ],
             "updateTime": "2026-05-01T07:05:00Z",
@@ -198,21 +188,6 @@ def test_map_distance():
     assert rec.type == ingest.HK_DISTANCE_WALKING_RUNNING
     assert float(rec.value) == pytest.approx(0.7)
     assert rec.unit == "m"
-
-
-def test_map_distance_legacy_field_fallback():
-    dp = {
-        "name": "users/x/dataTypes/distance/dataPoints/d1",
-        "distance": {
-            "interval": {
-                "startTime": "2026-05-01T10:00:00Z",
-                "endTime": "2026-05-01T10:15:00Z",
-            },
-            "distanceMillimeters": 1_609_344,  # 1 mile
-        },
-    }
-    rec = ingest.map_distance(dp)
-    assert float(rec.value) == pytest.approx(1609.344)
 
 
 def test_map_steps_live_fixture():
@@ -309,7 +284,7 @@ def test_map_body_fat():
     dp = {
         "name": "users/x/dataTypes/body-fat/dataPoints/bf1",
         "bodyFat": {
-            "time": "2026-05-01T08:00:00Z",
+            "sampleTime": {"physicalTime": "2026-05-01T08:00:00Z"},
             "percentage": 18.2,
             "updateTime": "2026-05-01T08:00:01Z",
         },
@@ -324,8 +299,8 @@ def test_map_height():
     dp = {
         "name": "users/x/dataTypes/height/dataPoints/h1",
         "height": {
-            "time": "2026-05-01T08:00:00Z",
-            "heightMeters": 1.78,
+            "sampleTime": {"physicalTime": "2026-05-01T08:00:00Z"},
+            "heightMillimeters": "1780",
             "updateTime": "2026-05-01T08:00:01Z",
         },
     }
@@ -475,7 +450,7 @@ def test_sync_user_persists_each_data_type(connection, customer):
                 "startTime": "2026-05-01T10:00:00Z",
                 "endTime": "2026-05-01T10:15:00Z",
             },
-            "stepCount": "500",
+            "count": "500",
             "updateTime": "2026-05-01T10:16:00Z",
         },
     }
@@ -493,7 +468,7 @@ def test_sync_user_persists_each_data_type(connection, customer):
     hr_dp = {
         "name": "users/me/dataTypes/heart-rate/dataPoints/hr1",
         "heartRate": {
-            "time": "2026-05-01T10:05:00Z",
+            "sampleTime": {"physicalTime": "2026-05-01T10:05:00Z"},
             "beatsPerMinute": 80,
             "updateTime": "2026-05-01T10:05:01Z",
         },
@@ -501,8 +476,8 @@ def test_sync_user_persists_each_data_type(connection, customer):
     weight_dp = {
         "name": "users/me/dataTypes/weight/dataPoints/w1",
         "weight": {
-            "time": "2026-05-01T08:00:00Z",
-            "weightKg": 70.0,
+            "sampleTime": {"physicalTime": "2026-05-01T08:00:00Z"},
+            "weightGrams": 70000,
             "updateTime": "2026-05-01T08:00:01Z",
         },
     }
@@ -515,18 +490,14 @@ def test_sync_user_persists_each_data_type(connection, customer):
             },
             "stages": [
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T03:00:00Z",
-                        "endTime": "2026-05-01T04:00:00Z",
-                    },
-                    "stage": "LIGHT",
+                    "startTime": "2026-05-01T03:00:00Z",
+                    "endTime": "2026-05-01T04:00:00Z",
+                    "type": "LIGHT",
                 },
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T04:00:00Z",
-                        "endTime": "2026-05-01T05:00:00Z",
-                    },
-                    "stage": "DEEP",
+                    "startTime": "2026-05-01T04:00:00Z",
+                    "endTime": "2026-05-01T05:00:00Z",
+                    "type": "DEEP",
                 },
             ],
             "updateTime": "2026-05-01T07:01:00Z",
@@ -961,7 +932,7 @@ def test_sync_user_against_real_api(db):
     oauth.refresh_access_token(conn)
     with GoogleHealthClient(conn) as client:
         identity = client.get_identity()
-    conn.google_user_id = identity.get("googleUserId") or identity.get("healthUserId")
+    conn.google_user_id = identity.get("healthUserId")
     conn.save(update_fields=["google_user_id"])
 
     end = datetime.now(timezone.utc)
@@ -1272,11 +1243,9 @@ def test_collect_records_is_window_bounded(connection, customer):
             },
             "stages": [
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T03:00:00Z",
-                        "endTime": "2026-05-01T07:00:00Z",
-                    },
-                    "stage": "DEEP",
+                    "startTime": "2026-05-01T03:00:00Z",
+                    "endTime": "2026-05-01T07:00:00Z",
+                    "type": "DEEP",
                 },
             ],
         },
@@ -1290,11 +1259,9 @@ def test_collect_records_is_window_bounded(connection, customer):
             },
             "stages": [
                 {
-                    "interval": {
-                        "startTime": "2023-01-01T03:00:00Z",
-                        "endTime": "2023-01-01T07:00:00Z",
-                    },
-                    "stage": "DEEP",
+                    "startTime": "2023-01-01T03:00:00Z",
+                    "endTime": "2023-01-01T07:00:00Z",
+                    "type": "DEEP",
                 },
             ],
         },

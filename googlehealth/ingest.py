@@ -196,16 +196,10 @@ def _creation_date(data_point: dict[str, Any]) -> datetime:
 def _sample_instant(block: dict[str, Any]) -> datetime:
     """Resolve the point-in-time for a Sample data type.
 
-    Production payload: ``{"sampleTime": {"physicalTime": "...Z", ...}}``.
-    Earlier drafts of this code expected a flat ``"time"`` field; we accept
-    either for resilience.
+    Live payload: ``{"sampleTime": {"physicalTime": "...Z", ...}}``.
     """
-    sample_time = block.get("sampleTime")
-    if isinstance(sample_time, dict) and sample_time.get("physicalTime"):
-        return _parse_dt(sample_time["physicalTime"])
-    if block.get("time"):
-        return _parse_dt(block["time"])
-    raise ValueError("Sample data point has no sampleTime.physicalTime or time field")
+    sample_time = block.get("sampleTime") or {}
+    return _parse_dt(sample_time.get("physicalTime"))
 
 
 # Mappers ---------------------------------------------------------------------
@@ -214,14 +208,12 @@ def _sample_instant(block: dict[str, Any]) -> datetime:
 def map_steps(data_point: dict[str, Any]) -> RecordInput:
     block = data_point["steps"]
     start, end = _interval_bounds(block)
-    # Live payload uses "count"; earlier drafts assumed "stepCount" — accept both.
-    count = block.get("count") or block.get("stepCount") or "0"
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=start,
         endDate=end,
         type=str(ActivityMetric.STEPS),
-        value=str(count),
+        value=str(block["count"]),
         unit="count",
     )
 
@@ -242,7 +234,7 @@ def map_active_energy_burned(data_point: dict[str, Any]) -> RecordInput:
         startDate=start,
         endDate=end,
         type=str(ActivityMetric.ACTIVE_CALORIES),
-        value=str(block.get("kcal", "0")),
+        value=str(block["kcal"]),
         unit="kcal",
     )
 
@@ -255,7 +247,7 @@ def map_heart_rate(data_point: dict[str, Any]) -> RecordInput:
         startDate=instant,
         endDate=instant,
         type=HK_HEART_RATE,
-        value=str(block.get("beatsPerMinute", "0")),
+        value=str(block["beatsPerMinute"]),
         unit="count/min",
     )
 
@@ -263,11 +255,7 @@ def map_heart_rate(data_point: dict[str, Any]) -> RecordInput:
 def map_weight(data_point: dict[str, Any]) -> RecordInput:
     block = data_point["weight"]
     instant = _sample_instant(block)
-    # Live payload uses weightGrams (integer); accept weightKg for back-compat.
-    if "weightGrams" in block:
-        weight_kg = float(block["weightGrams"]) / 1000.0
-    else:
-        weight_kg = float(block.get("weightKg", 0))
+    weight_kg = float(block["weightGrams"]) / 1000.0
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=instant,
@@ -285,16 +273,11 @@ def map_distance(data_point: dict[str, Any]) -> RecordInput:
     (string), matching the discovery doc's ``Distance`` schema. The
     ``distanceMillimeters`` spelling only exists in ``MetricsSummary``
     (exercise summaries) — reading it here silently stored "0.0" for every
-    native-path point. Old spellings kept as fallbacks.
+    native-path point.
     """
     block = data_point["distance"]
     start, end = _interval_bounds(block)
-    distance_mm = float(
-        block.get("millimeters")
-        or block.get("distanceMillimeters")
-        or block.get("distanceMillimiters")
-        or 0
-    )
+    distance_mm = float(block["millimeters"])
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=start,
@@ -311,14 +294,10 @@ def map_altitude(data_point: dict[str, Any]) -> RecordInput:
     Discovery doc's ``Altitude`` schema says ``gainMillimeters`` (string).
     Not yet live-verified — no altimeter device on the calibration account —
     but the discovery doc has matched every live-verified shape to date.
-    ``elevationGainMillimeters`` was borrowed from ``MetricsSummary``
-    (exercise summaries) and kept only as a fallback.
     """
     block = data_point["altitude"]
     start, end = _interval_bounds(block)
-    altitude_mm = float(
-        block.get("gainMillimeters") or block.get("elevationGainMillimeters") or 0
-    )
+    altitude_mm = float(block["gainMillimeters"])
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=start,
@@ -333,8 +312,7 @@ def map_floors(data_point: dict[str, Any]) -> RecordInput:
     """Floors climbed over an Interval.
 
     Discovery doc's ``Floors`` schema says ``count`` (string). Not yet
-    live-verified (no altimeter device on the calibration account); the
-    guessed ``floorsClimbed`` kept only as a fallback.
+    live-verified (no altimeter device on the calibration account).
     """
     block = data_point["floors"]
     start, end = _interval_bounds(block)
@@ -343,7 +321,7 @@ def map_floors(data_point: dict[str, Any]) -> RecordInput:
         startDate=start,
         endDate=end,
         type=HK_FLIGHTS_CLIMBED,
-        value=str(block.get("count") or block.get("floorsClimbed") or "0"),
+        value=str(block["count"]),
         unit="count",
     )
 
@@ -364,7 +342,7 @@ def map_active_zone_minutes(data_point: dict[str, Any]) -> RecordInput:
         startDate=start,
         endDate=end,
         type=HK_ACTIVE_ZONE_MINUTES,
-        value=str(block.get("activeZoneMinutes") or block.get("minutes") or "0"),
+        value=str(block["activeZoneMinutes"]),
         unit="min",
     )
 
@@ -383,7 +361,7 @@ def map_daily_resting_heart_rate(data_point: dict[str, Any]) -> RecordInput:
         startDate=start,
         endDate=end,
         type=HK_RESTING_HEART_RATE,
-        value=str(block.get("beatsPerMinute", "0")),
+        value=str(block["beatsPerMinute"]),
         unit="count/min",
     )
 
@@ -401,7 +379,7 @@ def map_daily_oxygen_saturation(data_point: dict[str, Any]) -> RecordInput:
         startDate=start,
         endDate=end,
         type=HK_OXYGEN_SATURATION,
-        value=str(block.get("averagePercentage") or block.get("percentage") or "0"),
+        value=str(block["averagePercentage"]),
         unit="%",
     )
 
@@ -415,7 +393,7 @@ def map_body_fat(data_point: dict[str, Any]) -> RecordInput:
         startDate=instant,
         endDate=instant,
         type=HK_BODY_FAT_PERCENTAGE,
-        value=str(block.get("percentage", "0")),
+        value=str(block["percentage"]),
         unit="%",
     )
 
@@ -424,11 +402,7 @@ def map_height(data_point: dict[str, Any]) -> RecordInput:
     """Height Sample (point in time). Live payload reports millimeters."""
     block = data_point["height"]
     instant = _sample_instant(block)
-    # Live payload: heightMillimeters as string. Older drafts assumed heightMeters/heightM.
-    if "heightMillimeters" in block:
-        height_m = float(block["heightMillimeters"]) / 1000.0
-    else:
-        height_m = float(block.get("heightMeters") or block.get("heightM") or 0)
+    height_m = float(block["heightMillimeters"]) / 1000.0
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=instant,
@@ -442,22 +416,18 @@ def map_height(data_point: dict[str, Any]) -> RecordInput:
 def map_sleep_session(data_point: dict[str, Any]) -> list[RecordInput]:
     """Decompose a Google sleep session into one Record per stage interval.
 
-    Live payload puts stage bounds on the stage object directly
-    (``stages[].startTime`` / ``stages[].endTime``); earlier guesses assumed a
-    nested ``interval`` block. We accept both. Stage label is ``stages[].type``.
+    Live payload puts stage bounds flat on the stage object
+    (``stages[].startTime`` / ``stages[].endTime``); the label is
+    ``stages[].type``. Unknown labels are skipped (mapping coverage, not a
+    payload error).
     """
     block = data_point["sleep"]
     common = _common_record_fields(data_point)
     records: list[RecordInput] = []
     for stage in block.get("stages") or []:
-        # Accept either flat (live) or nested (earlier-guessed) time shape.
-        if "startTime" in stage and "endTime" in stage:
-            start = _parse_dt(stage["startTime"])
-            end = _parse_dt(stage["endTime"])
-        else:
-            start, end = _interval_bounds(stage)
-        label = stage.get("type") or stage.get("stage", "")
-        mapped = _SLEEP_STAGE_MAP.get(str(label).upper())
+        start = _parse_dt(stage["startTime"])
+        end = _parse_dt(stage["endTime"])
+        mapped = _SLEEP_STAGE_MAP.get(str(stage["type"]).upper())
         if mapped is None:
             continue
         records.append(
@@ -503,7 +473,7 @@ def map_exercise(data_point: dict[str, Any]) -> WorkoutInput:
         sourceName=SOURCE_NAME,
         durationUnit="s",
         duration=duration_seconds,
-        workoutActivityType=str(block.get("exerciseType", "UNKNOWN")),
+        workoutActivityType=str(block["exerciseType"]),
         caloriesBurned=float(metrics["caloriesKcal"])
         if "caloriesKcal" in metrics
         else None,

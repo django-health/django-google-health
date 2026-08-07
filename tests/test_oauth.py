@@ -74,7 +74,7 @@ def test_exchange_code_state_mismatch_raises_without_http_call():
 @respx.mock
 def test_ingest_tokens_creates_connection_and_fetches_user_id(customer):
     respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/identity").mock(
-        return_value=Response(200, json={"googleUserId": "999-google-id"})
+        return_value=Response(200, json={"healthUserId": "999-google-id"})
     )
 
     tokens = GoogleTokens(
@@ -108,7 +108,7 @@ def test_ingest_tokens_skips_identity_fetch_when_user_id_supplied(customer):
 @respx.mock
 def test_ingest_tokens_updates_existing_connection(customer, connection):
     respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/identity").mock(
-        return_value=Response(200, json={"googleUserId": connection.google_user_id})
+        return_value=Response(200, json={"healthUserId": connection.google_user_id})
     )
     tokens = GoogleTokens(
         access_token="ya29.rotated",
@@ -388,7 +388,7 @@ def test_ingest_tokens_reconnect_after_unlinked_restores_active(customer):
     conn = oauth.ingest_tokens(customer=customer, tokens=_tokens())
     assert conn.status == ConnectionStatus.UNLINKED
 
-    identity.mock(return_value=Response(200, json={"googleUserId": "right-account"}))
+    identity.mock(return_value=Response(200, json={"healthUserId": "right-account"}))
     conn = oauth.ingest_tokens(customer=customer, tokens=_tokens())
 
     assert conn.status == ConnectionStatus.ACTIVE
