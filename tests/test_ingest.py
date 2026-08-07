@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -19,12 +19,12 @@ from googlehealth.client import GoogleHealthClient
 from googlehealth.constants import (
     API_BASE_URL,
     API_VERSION,
+    DATA_TYPE_ACTIVE_ENERGY_BURNED,
     DATA_TYPE_DAILY_RESTING_HEART_RATE,
     DATA_TYPE_EXERCISE,
     DATA_TYPE_HEART_RATE,
     DATA_TYPE_SLEEP,
     DATA_TYPE_STEPS,
-    DATA_TYPE_TOTAL_CALORIES,
     DATA_TYPE_WEIGHT,
     OAUTH_TOKEN_URL,
     SCOPE_ACTIVITY_AND_FITNESS_READONLY,
@@ -58,7 +58,7 @@ def test_map_steps():
                 "startTime": "2026-05-01T10:00:00Z",
                 "endTime": "2026-05-01T10:15:00Z",
             },
-            "stepCount": "1234",
+            "count": "1234",
             "updateTime": "2026-05-01T10:20:00Z",
         },
     }
@@ -72,29 +72,24 @@ def test_map_steps():
     assert rec.endDate == datetime(2026, 5, 1, 10, 15, tzinfo=timezone.utc)
 
 
-def test_map_total_calories_uses_active_calories_type():
-    dp = {
-        "name": "users/x/dataTypes/total-calories/dataPoints/c1",
-        "totalCalories": {
-            "interval": {
-                "startTime": "2026-05-01T10:00:00Z",
-                "endTime": "2026-05-01T10:15:00Z",
-            },
-            "caloriesKcal": 42.5,
-            "updateTime": "2026-05-01T10:20:00Z",
-        },
-    }
-    rec = ingest.map_total_calories(dp)
+def test_map_active_energy_burned_live_fixture():
+    """Live fixture (2026-08-07): per-minute interval with a ``kcal`` number.
+    Google's own basal-excluded series — replaced reconstructing active energy
+    from total-calories minus an estimated basal rate."""
+    dp = _fixture("active_energy_burned.json")
+    rec = ingest.map_active_energy_burned(dp)
     assert rec.type == str(ActivityMetric.ACTIVE_CALORIES)
-    assert rec.value == "42.5"
+    assert float(rec.value) == pytest.approx(0.793398)
     assert rec.unit == "kcal"
+    assert rec.startDate == datetime(2026, 8, 7, 15, 4, tzinfo=timezone.utc)
+    assert rec.endDate == datetime(2026, 8, 7, 15, 5, tzinfo=timezone.utc)
 
 
 def test_map_heart_rate_point_in_time():
     dp = {
         "name": "users/x/dataTypes/heart-rate/dataPoints/h1",
         "heartRate": {
-            "time": "2026-05-01T10:00:00Z",
+            "sampleTime": {"physicalTime": "2026-05-01T10:00:00Z"},
             "beatsPerMinute": 72,
             "updateTime": "2026-05-01T10:00:01Z",
         },
@@ -109,8 +104,8 @@ def test_map_weight():
     dp = {
         "name": "users/x/dataTypes/weight/dataPoints/w1",
         "weight": {
-            "time": "2026-05-01T08:00:00Z",
-            "weightKg": 75.4,
+            "sampleTime": {"physicalTime": "2026-05-01T08:00:00Z"},
+            "weightGrams": 75400,
             "updateTime": "2026-05-01T08:00:01Z",
         },
     }
@@ -145,39 +140,29 @@ def test_map_sleep_session_decomposes_stages():
             },
             "stages": [
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T03:00:00Z",
-                        "endTime": "2026-05-01T04:00:00Z",
-                    },
-                    "stage": "LIGHT",
+                    "startTime": "2026-05-01T03:00:00Z",
+                    "endTime": "2026-05-01T04:00:00Z",
+                    "type": "LIGHT",
                 },
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T04:00:00Z",
-                        "endTime": "2026-05-01T05:30:00Z",
-                    },
-                    "stage": "DEEP",
+                    "startTime": "2026-05-01T04:00:00Z",
+                    "endTime": "2026-05-01T05:30:00Z",
+                    "type": "DEEP",
                 },
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T05:30:00Z",
-                        "endTime": "2026-05-01T06:30:00Z",
-                    },
-                    "stage": "REM",
+                    "startTime": "2026-05-01T05:30:00Z",
+                    "endTime": "2026-05-01T06:30:00Z",
+                    "type": "REM",
                 },
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T06:30:00Z",
-                        "endTime": "2026-05-01T07:00:00Z",
-                    },
-                    "stage": "AWAKE",
+                    "startTime": "2026-05-01T06:30:00Z",
+                    "endTime": "2026-05-01T07:00:00Z",
+                    "type": "AWAKE",
                 },
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T07:00:00Z",
-                        "endTime": "2026-05-01T07:01:00Z",
-                    },
-                    "stage": "WEIRD_NEW_STAGE",  # unknown stages are skipped
+                    "startTime": "2026-05-01T07:00:00Z",
+                    "endTime": "2026-05-01T07:01:00Z",
+                    "type": "WEIRD_NEW_STAGE",  # unknown stages are skipped
                 },
             ],
             "updateTime": "2026-05-01T07:05:00Z",
@@ -203,21 +188,6 @@ def test_map_distance():
     assert rec.type == ingest.HK_DISTANCE_WALKING_RUNNING
     assert float(rec.value) == pytest.approx(0.7)
     assert rec.unit == "m"
-
-
-def test_map_distance_legacy_field_fallback():
-    dp = {
-        "name": "users/x/dataTypes/distance/dataPoints/d1",
-        "distance": {
-            "interval": {
-                "startTime": "2026-05-01T10:00:00Z",
-                "endTime": "2026-05-01T10:15:00Z",
-            },
-            "distanceMillimeters": 1_609_344,  # 1 mile
-        },
-    }
-    rec = ingest.map_distance(dp)
-    assert float(rec.value) == pytest.approx(1609.344)
 
 
 def test_map_steps_live_fixture():
@@ -314,7 +284,7 @@ def test_map_body_fat():
     dp = {
         "name": "users/x/dataTypes/body-fat/dataPoints/bf1",
         "bodyFat": {
-            "time": "2026-05-01T08:00:00Z",
+            "sampleTime": {"physicalTime": "2026-05-01T08:00:00Z"},
             "percentage": 18.2,
             "updateTime": "2026-05-01T08:00:01Z",
         },
@@ -329,8 +299,8 @@ def test_map_height():
     dp = {
         "name": "users/x/dataTypes/height/dataPoints/h1",
         "height": {
-            "time": "2026-05-01T08:00:00Z",
-            "heightMeters": 1.78,
+            "sampleTime": {"physicalTime": "2026-05-01T08:00:00Z"},
+            "heightMillimeters": "1780",
             "updateTime": "2026-05-01T08:00:01Z",
         },
     }
@@ -345,16 +315,17 @@ def test_default_data_types_includes_all_mapped_types():
     """Ensure the default sweep covers every mapper we expose."""
     assert set(ingest.DEFAULT_DATA_TYPES) >= {
         DATA_TYPE_STEPS,
+        DATA_TYPE_ACTIVE_ENERGY_BURNED,
         DATA_TYPE_HEART_RATE,
         DATA_TYPE_WEIGHT,
         DATA_TYPE_SLEEP,
         DATA_TYPE_EXERCISE,
     }
-    # total-calories and floors are excluded from DEFAULT_DATA_TYPES because
-    # Google rejects `list` for them — they need a dailyRollUp path we haven't
-    # built yet. They're still mapped (the mapper functions exist) so the
-    # consumer can wire them in once that path lands.
-    assert DATA_TYPE_TOTAL_CALORIES in ingest.ROLLUP_ONLY_DATA_TYPES
+    # floors is excluded from DEFAULT_DATA_TYPES because Google rejects `list`
+    # for it — it only joins the sweep when a resolution is set (rollUp path).
+    from googlehealth.constants import DATA_TYPE_FLOORS
+
+    assert DATA_TYPE_FLOORS in ingest.ROLLUP_ONLY_DATA_TYPES
     # And the new ones from slice 7.
     from googlehealth.constants import (
         DATA_TYPE_ACTIVE_ZONE_MINUTES,
@@ -479,25 +450,25 @@ def test_sync_user_persists_each_data_type(connection, customer):
                 "startTime": "2026-05-01T10:00:00Z",
                 "endTime": "2026-05-01T10:15:00Z",
             },
-            "stepCount": "500",
+            "count": "500",
             "updateTime": "2026-05-01T10:16:00Z",
         },
     }
     calories_dp = {
-        "name": "users/me/dataTypes/total-calories/dataPoints/c1",
-        "totalCalories": {
+        "name": "users/me/dataTypes/active-energy-burned/dataPoints/c1",
+        "activeEnergyBurned": {
             "interval": {
                 "startTime": "2026-05-01T10:00:00Z",
                 "endTime": "2026-05-01T10:15:00Z",
             },
-            "caloriesKcal": 35,
+            "kcal": 35,
             "updateTime": "2026-05-01T10:16:00Z",
         },
     }
     hr_dp = {
         "name": "users/me/dataTypes/heart-rate/dataPoints/hr1",
         "heartRate": {
-            "time": "2026-05-01T10:05:00Z",
+            "sampleTime": {"physicalTime": "2026-05-01T10:05:00Z"},
             "beatsPerMinute": 80,
             "updateTime": "2026-05-01T10:05:01Z",
         },
@@ -505,8 +476,8 @@ def test_sync_user_persists_each_data_type(connection, customer):
     weight_dp = {
         "name": "users/me/dataTypes/weight/dataPoints/w1",
         "weight": {
-            "time": "2026-05-01T08:00:00Z",
-            "weightKg": 70.0,
+            "sampleTime": {"physicalTime": "2026-05-01T08:00:00Z"},
+            "weightGrams": 70000,
             "updateTime": "2026-05-01T08:00:01Z",
         },
     }
@@ -519,18 +490,14 @@ def test_sync_user_persists_each_data_type(connection, customer):
             },
             "stages": [
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T03:00:00Z",
-                        "endTime": "2026-05-01T04:00:00Z",
-                    },
-                    "stage": "LIGHT",
+                    "startTime": "2026-05-01T03:00:00Z",
+                    "endTime": "2026-05-01T04:00:00Z",
+                    "type": "LIGHT",
                 },
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T04:00:00Z",
-                        "endTime": "2026-05-01T05:00:00Z",
-                    },
-                    "stage": "DEEP",
+                    "startTime": "2026-05-01T04:00:00Z",
+                    "endTime": "2026-05-01T05:00:00Z",
+                    "type": "DEEP",
                 },
             ],
             "updateTime": "2026-05-01T07:01:00Z",
@@ -551,7 +518,7 @@ def test_sync_user_persists_each_data_type(connection, customer):
 
     for data_type, dp in [
         (DATA_TYPE_STEPS, steps_dp),
-        (DATA_TYPE_TOTAL_CALORIES, calories_dp),
+        (DATA_TYPE_ACTIVE_ENERGY_BURNED, calories_dp),
         (DATA_TYPE_HEART_RATE, hr_dp),
         (DATA_TYPE_WEIGHT, weight_dp),
         (DATA_TYPE_SLEEP, sleep_dp),
@@ -568,7 +535,7 @@ def test_sync_user_persists_each_data_type(connection, customer):
         end=end,
         data_types=[
             DATA_TYPE_STEPS,
-            DATA_TYPE_TOTAL_CALORIES,
+            DATA_TYPE_ACTIVE_ENERGY_BURNED,
             DATA_TYPE_HEART_RATE,
             DATA_TYPE_WEIGHT,
             DATA_TYPE_SLEEP,
@@ -579,7 +546,7 @@ def test_sync_user_persists_each_data_type(connection, customer):
 
     # Per-type counts
     assert result.counts[DATA_TYPE_STEPS] == 1
-    assert result.counts[DATA_TYPE_TOTAL_CALORIES] == 1
+    assert result.counts[DATA_TYPE_ACTIVE_ENERGY_BURNED] == 1
     assert result.counts[DATA_TYPE_HEART_RATE] == 1
     assert result.counts[DATA_TYPE_WEIGHT] == 1
     assert result.counts[DATA_TYPE_SLEEP] == 2  # two stages
@@ -665,123 +632,124 @@ def test_sync_user_handles_expired_token(customer):
 # ---------------------------------------------------------------------------
 
 
-def _seed_height_weight(customer, *, height_m: float, weight_kg: float, when: datetime):
-    """Seed Record rows so compute_basal_calories has weight + height to read."""
-    from healthdatamodel.models import Record
-
-    common = {
-        "customer": customer,
-        "startDate": when,
-        "endDate": when,
-        "creationDate": when,
-        "admin_create_date": when,
-        "sourceName": "seed",
-        "source": DataSource.GOOGLE_HEALTH,
+def _rollup_page(block_key: str, windows: list[tuple[str, str, float]]) -> dict:
+    return {
+        "rollupDataPoints": [
+            {"startTime": s, "endTime": e, block_key: {"kcalSum": kcal}}
+            for s, e, kcal in windows
+        ],
+        "nextPageToken": "",
     }
-    Record.objects.create(
-        **common, type=ingest.HK_HEIGHT, value=str(height_m), unit="m"
-    )
-    Record.objects.create(
-        **common, type=ingest.HK_BODY_MASS, value=str(weight_kg), unit="kg"
-    )
-
-
-@pytest.mark.django_db
-def test_compute_basal_calories_uses_mifflin_when_height_weight_available(connection):
-    from healthdatamodel.models import Record
-    from healthdatamodel.query import ActivityMetric
-
-    customer = connection.customer
-    seed_when = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    _seed_height_weight(customer, height_m=1.80, weight_kg=80.0, when=seed_when)
-
-    from healthdatamodel.bmr import age_from_dob, calculate_bmr
-
-    dob = date(1990, 1, 1)
-    profile = {"birthday": dob.isoformat(), "gender": "MALE"}
-    start = datetime(2026, 5, 1, tzinfo=timezone.utc)
-    end = datetime(2026, 5, 3, tzinfo=timezone.utc)
-
-    count = ingest.compute_basal_calories(
-        connection, start=start, end=end, profile=profile
-    )
-
-    assert count == 3  # May 1, 2, 3
-    records = Record.objects.filter(
-        customer=customer, type=str(ActivityMetric.BASAL_CALORIES)
-    ).order_by("startDate")
-    assert records.count() == 3
-    expected = calculate_bmr(age_from_dob(dob), "M", 80.0, 180.0)
-    for rec in records:
-        assert float(rec.value) == pytest.approx(expected, rel=1e-6)
-    assert {r.unit for r in records} == {"kcal"}
-
-
-@pytest.mark.django_db
-def test_compute_basal_calories_falls_back_to_lookup_when_records_missing(connection):
-    from healthdatamodel.models import Record
-    from healthdatamodel.query import ActivityMetric
-
-    profile = {"birthday": "1990-05-15", "gender": "MALE"}
-    count = ingest.compute_basal_calories(
-        connection,
-        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        end=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        profile=profile,
-    )
-    assert count == 1
-    rec = Record.objects.get(
-        customer=connection.customer, type=str(ActivityMetric.BASAL_CALORIES)
-    )
-    # get_bmr's lookup table for a 35yo male yields a positive BMR, not the
-    # 2000 default — we don't pin the exact value (the tables drift over time).
-    assert float(rec.value) > 1000.0
-
-
-@pytest.mark.django_db
-def test_compute_basal_calories_returns_default_when_profile_blank(connection):
-    from healthdatamodel.bmr import DEFAULT_BMR
-    from healthdatamodel.models import Record
-    from healthdatamodel.query import ActivityMetric
-
-    count = ingest.compute_basal_calories(
-        connection,
-        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        end=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        profile={},
-    )
-    assert count == 1
-    rec = Record.objects.get(
-        customer=connection.customer, type=str(ActivityMetric.BASAL_CALORIES)
-    )
-    assert float(rec.value) == DEFAULT_BMR
-
-
-@pytest.mark.django_db
-def test_compute_basal_calories_handles_civil_date_dob(connection):
-    """Google's civil-date {year, month, day} shape should parse like ISO strings."""
-    count = ingest.compute_basal_calories(
-        connection,
-        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        end=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        profile={"birthday": {"year": 1990, "month": 5, "day": 15}, "gender": "FEMALE"},
-    )
-    assert count == 1
 
 
 @respx.mock
-def test_sync_user_with_compute_basal_calls_profile_and_persists(connection):
+def test_compute_basal_calories_derives_total_minus_active(connection):
+    """Basal = Google's own ledger: daily total-calories − active-energy-burned.
+    A day with no total window is skipped (device not synced); a day with no
+    active window counts active as 0."""
+    from healthdatamodel.models import Record
+    from healthdatamodel.query import ActivityMetric
+
+    respx.post(_rollup_url("total-calories")).mock(
+        return_value=Response(
+            200,
+            json=_rollup_page(
+                "totalCalories",
+                [
+                    ("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", 5000.0),
+                    ("2026-05-02T00:00:00Z", "2026-05-03T00:00:00Z", 2000.0),
+                ],
+            ),
+        )
+    )
+    respx.post(_rollup_url("active-energy-burned")).mock(
+        return_value=Response(
+            200,
+            json=_rollup_page(
+                "activeEnergyBurned",
+                [("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", 2900.0)],
+            ),
+        )
+    )
+
+    count = ingest.compute_basal_calories(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        # Window covers May 1-3; May 3 has no total window -> skipped.
+        end=datetime(2026, 5, 3, tzinfo=timezone.utc),
+    )
+
+    assert count == 2
+    records = Record.objects.filter(
+        customer=connection.customer, type=str(ActivityMetric.BASAL_CALORIES)
+    ).order_by("startDate")
+    assert [r.value for r in records] == ["2100.000", "2000.000"]
+    assert records[0].startDate == datetime(2026, 5, 1, tzinfo=timezone.utc)
+    assert records[0].endDate == datetime(2026, 5, 2, tzinfo=timezone.utc)
+    assert {r.unit for r in records} == {"kcal"}
+
+
+@respx.mock
+def test_compute_basal_calories_floors_at_zero(connection):
+    """active > total (clock skew / partial windows) must not go negative."""
+    from healthdatamodel.models import Record
+    from healthdatamodel.query import ActivityMetric
+
+    windows = [("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", 100.0)]
+    respx.post(_rollup_url("total-calories")).mock(
+        return_value=Response(200, json=_rollup_page("totalCalories", windows))
+    )
+    respx.post(_rollup_url("active-energy-burned")).mock(
+        return_value=Response(
+            200,
+            json=_rollup_page(
+                "activeEnergyBurned",
+                [("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", 150.0)],
+            ),
+        )
+    )
+
+    ingest.compute_basal_calories(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 1, tzinfo=timezone.utc),
+    )
+    rec = Record.objects.get(
+        customer=connection.customer, type=str(ActivityMetric.BASAL_CALORIES)
+    )
+    assert rec.value == "0.000"
+
+
+@respx.mock
+def test_sync_user_with_compute_basal_derives_and_persists(connection):
     """Wired through sync_user: the basal step runs after the main loop."""
     from healthdatamodel.models import Record
     from healthdatamodel.query import ActivityMetric
 
-    customer = connection.customer
-    seed_when = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    _seed_height_weight(customer, height_m=1.65, weight_kg=60.0, when=seed_when)
-
     respx.get(_dp_url(DATA_TYPE_STEPS)).mock(return_value=Response(200, json=_page([])))
-    respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/profile").mock(
-        return_value=Response(200, json={"birthday": "1995-01-01", "gender": "F"})
+    respx.post(_rollup_url("total-calories")).mock(
+        return_value=Response(
+            200,
+            json=_rollup_page(
+                "totalCalories",
+                [
+                    ("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", 4000.0),
+                    ("2026-05-02T00:00:00Z", "2026-05-03T00:00:00Z", 3000.0),
+                ],
+            ),
+        )
+    )
+    respx.post(_rollup_url("active-energy-burned")).mock(
+        return_value=Response(
+            200,
+            json=_rollup_page(
+                "activeEnergyBurned",
+                [
+                    ("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", 1500.0),
+                    ("2026-05-02T00:00:00Z", "2026-05-03T00:00:00Z", 500.0),
+                ],
+            ),
+        )
     )
 
     result = ingest.sync_user(
@@ -793,13 +761,11 @@ def test_sync_user_with_compute_basal_calls_profile_and_persists(connection):
     )
 
     assert result.counts[DATA_TYPE_STEPS] == 0
-    assert result.counts["basal-calories"] == 2  # 2026-05-01, 2026-05-02
-    assert (
-        Record.objects.filter(
-            customer=customer, type=str(ActivityMetric.BASAL_CALORIES)
-        ).count()
-        == 2
-    )
+    assert result.counts["basal-calories"] == 2
+    records = Record.objects.filter(
+        customer=connection.customer, type=str(ActivityMetric.BASAL_CALORIES)
+    ).order_by("startDate")
+    assert [r.value for r in records] == ["2500.000", "2500.000"]
 
 
 def _rollup_url(data_type: str) -> str:
@@ -878,11 +844,11 @@ def test_sync_user_with_resolution_falls_back_to_list_for_unsupported_types(conn
 
 @respx.mock
 def test_sync_user_resolution_expands_to_rollup_only_types(connection):
-    """When data_types is None + resolution_minutes is set, total-calories +
-    floors join the default sweep (the list endpoint rejects them)."""
+    """When data_types is None + resolution_minutes is set, floors joins the
+    default sweep (the list endpoint rejects it)."""
 
     # Mock every data type's rollup endpoint as empty; only assert that
-    # total-calories was queried at all.
+    # floors was queried at all.
     for dt in ingest.DEFAULT_DATA_TYPES:
         if dt in ingest._ROLLUP_UNSUPPORTED_DATA_TYPES:
             respx.get(_dp_url(dt)).mock(return_value=Response(200, json=_page([])))
@@ -899,7 +865,6 @@ def test_sync_user_resolution_expands_to_rollup_only_types(connection):
                         {
                             "startTime": "2026-05-01T00:00:00Z",
                             "endTime": "2026-05-02T00:00:00Z",
-                            "totalCalories": {"kcalSum": 2200.5},
                             "floors": {"countSum": "12"},
                         }
                     ],
@@ -918,12 +883,11 @@ def test_sync_user_resolution_expands_to_rollup_only_types(connection):
         compute_basal=False,
     )
 
-    assert "total-calories" in result.counts
     assert "floors" in result.counts
-    # Each ROLLUP_ONLY type fetch returned one rollup point with both blocks
-    # populated — the relevant mapper produced one Record.
-    assert result.counts["total-calories"] == 1
     assert result.counts["floors"] == 1
+    # total-calories is gone entirely — active energy comes from the
+    # active-energy-burned series in DEFAULT_DATA_TYPES instead.
+    assert "total-calories" not in result.counts
 
 
 def test_sync_user_rejects_negative_resolution(connection):
@@ -968,13 +932,58 @@ def test_sync_user_against_real_api(db):
     oauth.refresh_access_token(conn)
     with GoogleHealthClient(conn) as client:
         identity = client.get_identity()
-    conn.google_user_id = identity.get("googleUserId") or identity.get("healthUserId")
+    conn.google_user_id = identity.get("healthUserId")
     conn.save(update_fields=["google_user_id"])
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(hours=24)
     result = ingest.sync_user(conn, start=start, end=end, data_types=[DATA_TYPE_STEPS])
     assert DATA_TYPE_STEPS in result.counts
+
+
+@pytest.mark.live
+def test_basal_energy_burned_watchdog(db):
+    """Fails the day Google starts populating basal-energy-burned.
+
+    The type is officially the true BMR series (Fitbit ``caloriesBMR`` per
+    the migration mapping table), but as of 2026-08-07 it supports only
+    ``list``/``reconcile`` and returns zero points for Fitbit accounts —
+    which is why ``compute_basal_calories`` derives basal as total − active
+    instead. If this test fails, real measured BMR data has arrived: switch
+    the derivation to the measured series (see compute_basal_calories's
+    docstring) and retire this watchdog.
+    """
+    refresh_token = os.getenv("GOOGLE_HEALTH_TEST_REFRESH_TOKEN")
+    client_id = os.getenv("GOOGLE_HEALTH_TEST_CLIENT_ID")
+    client_secret = os.getenv("GOOGLE_HEALTH_TEST_CLIENT_SECRET")
+    if not (refresh_token and client_id and client_secret):
+        pytest.skip("set GOOGLE_HEALTH_TEST_* env vars to enable")
+
+    from django.conf import settings
+    from django.contrib.auth import get_user_model
+
+    settings.GOOGLE_HEALTH_CLIENT_ID = client_id
+    settings.GOOGLE_HEALTH_CLIENT_SECRET = client_secret
+
+    User = get_user_model()
+    customer = User.objects.create_user(username="live-basal-watchdog")
+    conn = GoogleHealthConnection.objects.create(
+        customer=customer,
+        google_user_id="placeholder",
+        access_token="placeholder",
+        refresh_token=refresh_token,
+        token_expires_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        scopes=[SCOPE_ACTIVITY_AND_FITNESS_READONLY],
+    )
+    oauth.refresh_access_token(conn)
+    with GoogleHealthClient(conn) as client:
+        points = list(client.iter_data_points("basal-energy-burned"))
+
+    assert points == [], (
+        "basal-energy-burned now returns data! Google shipped the measured "
+        "BMR series — switch compute_basal_calories from the total − active "
+        f"derivation to it. First point: {points[0] if points else None}"
+    )
 
 
 # Server-side filters, failure isolation, active-energy conversion ------------
@@ -1065,11 +1074,11 @@ def test_sync_user_sends_sample_time_filter_for_heart_rate(connection):
 
 
 @respx.mock
-def test_sync_user_basal_rate_converts_total_calories_to_active(connection, customer):
-    """With basal_rate set, total-calories windows are stored as ACTIVE energy:
-    pro-rata basal subtracted, floored at 0 (Apple ActiveEnergyBurned semantics
-    — a sedentary window is 0 active kcal, not its BMR share)."""
-    respx.post(_rollup_url(DATA_TYPE_TOTAL_CALORIES)).mock(
+def test_sync_user_active_energy_burned_rollup(connection, customer):
+    """Rollup path for active-energy-burned: kcalSum stored as ACTIVE energy
+    unmodified — the series is already basal-excluded, so no conversion (the
+    pre-0.9.0 basal_rate reconstruction is gone)."""
+    respx.post(_rollup_url(DATA_TYPE_ACTIVE_ENERGY_BURNED)).mock(
         return_value=Response(
             200,
             json={
@@ -1077,12 +1086,7 @@ def test_sync_user_basal_rate_converts_total_calories_to_active(connection, cust
                     {
                         "startTime": "2026-05-01T00:00:00Z",
                         "endTime": "2026-05-01T00:15:00Z",
-                        "totalCalories": {"kcalSum": 25.0},
-                    },
-                    {
-                        "startTime": "2026-05-01T00:15:00Z",
-                        "endTime": "2026-05-01T00:30:00Z",
-                        "totalCalories": {"kcalSum": 5.0},
+                        "activeEnergyBurned": {"kcalSum": 25.0},
                     },
                 ],
                 "nextPageToken": "",
@@ -1094,42 +1098,7 @@ def test_sync_user_basal_rate_converts_total_calories_to_active(connection, cust
         connection,
         start=datetime(2026, 5, 1, tzinfo=timezone.utc),
         end=datetime(2026, 5, 2, tzinfo=timezone.utc),
-        data_types=[DATA_TYPE_TOTAL_CALORIES],
-        resolution_minutes=15,
-        compute_basal=False,
-        basal_rate=960.0,  # 960 kcal/day -> exactly 10 kcal per 900s window
-    )
-
-    records = Record.objects.filter(
-        customer=customer, type=str(ActivityMetric.ACTIVE_CALORIES)
-    ).order_by("startDate")
-    assert [r.value for r in records] == ["15.000", "0.000"]
-
-
-@respx.mock
-def test_sync_user_without_basal_rate_keeps_raw_totals(connection, customer):
-    """Back-compat: no basal_rate -> totals stored unmodified."""
-    respx.post(_rollup_url(DATA_TYPE_TOTAL_CALORIES)).mock(
-        return_value=Response(
-            200,
-            json={
-                "rollupDataPoints": [
-                    {
-                        "startTime": "2026-05-01T00:00:00Z",
-                        "endTime": "2026-05-01T00:15:00Z",
-                        "totalCalories": {"kcalSum": 25.0},
-                    },
-                ],
-                "nextPageToken": "",
-            },
-        )
-    )
-
-    ingest.sync_user(
-        connection,
-        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
-        data_types=[DATA_TYPE_TOTAL_CALORIES],
+        data_types=[DATA_TYPE_ACTIVE_ENERGY_BURNED],
         resolution_minutes=15,
         compute_basal=False,
     )
@@ -1201,10 +1170,10 @@ def test_sync_user_isolates_per_type_failures(connection, customer):
 
 @respx.mock
 def test_sync_user_compute_basal_failure_recorded_not_raised(connection, customer):
-    """compute_basal is an enrichment: a profile 403 (token minted without the
-    profile scope) must not discard an otherwise-complete sync."""
+    """compute_basal is an enrichment: a failing rollup fetch must not
+    discard an otherwise-complete sync."""
     respx.get(_dp_url(DATA_TYPE_STEPS)).mock(return_value=Response(200, json=_page([])))
-    respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/profile").mock(
+    respx.post(_rollup_url("total-calories")).mock(
         return_value=Response(403, json={"error": {"message": "insufficient scopes"}})
     )
 
@@ -1319,11 +1288,9 @@ def test_collect_records_is_window_bounded(connection, customer):
             },
             "stages": [
                 {
-                    "interval": {
-                        "startTime": "2026-05-01T03:00:00Z",
-                        "endTime": "2026-05-01T07:00:00Z",
-                    },
-                    "stage": "DEEP",
+                    "startTime": "2026-05-01T03:00:00Z",
+                    "endTime": "2026-05-01T07:00:00Z",
+                    "type": "DEEP",
                 },
             ],
         },
@@ -1337,11 +1304,9 @@ def test_collect_records_is_window_bounded(connection, customer):
             },
             "stages": [
                 {
-                    "interval": {
-                        "startTime": "2023-01-01T03:00:00Z",
-                        "endTime": "2023-01-01T07:00:00Z",
-                    },
-                    "stage": "DEEP",
+                    "startTime": "2023-01-01T03:00:00Z",
+                    "endTime": "2023-01-01T07:00:00Z",
+                    "type": "DEEP",
                 },
             ],
         },

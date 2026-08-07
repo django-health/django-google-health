@@ -2,7 +2,7 @@
 
 Mappers cover the beachhead data types:
 
-  steps, total-calories, heart-rate, weight  → :class:`RecordInput` (Sample/Interval)
+  steps, active-energy-burned, heart-rate, weight → :class:`RecordInput` (Sample/Interval)
   sleep                                       → list[:class:`RecordInput`] (one per stage)
   exercise                                    → :class:`WorkoutInput`
 
@@ -12,10 +12,13 @@ daily-resting-heart-rate, daily-oxygen-saturation, body-fat.
 Caveats — Google Health's data model isn't 1:1 with Apple HealthKit (which is what
 ``healthdatamodel`` schemas mirror):
 
-* Google exposes a single ``total-calories`` type. We map it to
-  ``ActivityMetric.ACTIVE_CALORIES`` because that's the closest semantic match
-  (Fitbit's caloriesOut historically lands there). ``BASAL_CALORIES`` is not
-  available from the Google Health API.
+* Energy: ``active-energy-burned`` (basal-excluded, live since ~Aug 2026) maps
+  to ``ActivityMetric.ACTIVE_CALORIES``. ``total-calories`` is deliberately not
+  ingested — totals include basal burn, and storing them as ACTIVE inflates
+  downstream MET math — but its rollups feed :func:`compute_basal_calories`,
+  which derives the daily ``BASAL_CALORIES`` series as total − active.
+  (``basal-energy-burned`` exists in the API schema but returns no data for
+  Fitbit accounts, probed 2026-08-07.)
 * ``HKAltitudeGain`` is a non-standard identifier — Apple HealthKit doesn't have
   a direct analog for cumulative elevation gain over an interval.
 
@@ -30,16 +33,14 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
-import dateutil.parser
-from healthdatamodel.bmr import age_from_dob, calculate_bmr, get_bmr
 from healthdatamodel.constants import DataSource
 from healthdatamodel.ingest import ingest_records, ingest_workouts
-from healthdatamodel.models import Record
 from healthdatamodel.query import SLEEP_TYPE, ActivityMetric, SleepValue
 from healthdatamodel.schemas import MetadataEntry, RecordInput, WorkoutInput
 
 from .client import GoogleHealthAPIError, GoogleHealthClient
 from .constants import (
+    DATA_TYPE_ACTIVE_ENERGY_BURNED,
     DATA_TYPE_ACTIVE_ZONE_MINUTES,
     DATA_TYPE_ALTITUDE,
     DATA_TYPE_BODY_FAT,
@@ -52,7 +53,6 @@ from .constants import (
     DATA_TYPE_HEIGHT,
     DATA_TYPE_SLEEP,
     DATA_TYPE_STEPS,
-    DATA_TYPE_TOTAL_CALORIES,
     DATA_TYPE_WEIGHT,
     ERROR_REASON_ACCOUNT_NOT_LINKED,
     SOURCE_NAME,
@@ -196,16 +196,10 @@ def _creation_date(data_point: dict[str, Any]) -> datetime:
 def _sample_instant(block: dict[str, Any]) -> datetime:
     """Resolve the point-in-time for a Sample data type.
 
-    Production payload: ``{"sampleTime": {"physicalTime": "...Z", ...}}``.
-    Earlier drafts of this code expected a flat ``"time"`` field; we accept
-    either for resilience.
+    Live payload: ``{"sampleTime": {"physicalTime": "...Z", ...}}``.
     """
-    sample_time = block.get("sampleTime")
-    if isinstance(sample_time, dict) and sample_time.get("physicalTime"):
-        return _parse_dt(sample_time["physicalTime"])
-    if block.get("time"):
-        return _parse_dt(block["time"])
-    raise ValueError("Sample data point has no sampleTime.physicalTime or time field")
+    sample_time = block.get("sampleTime") or {}
+    return _parse_dt(sample_time.get("physicalTime"))
 
 
 # Mappers ---------------------------------------------------------------------
@@ -214,27 +208,36 @@ def _sample_instant(block: dict[str, Any]) -> datetime:
 def map_steps(data_point: dict[str, Any]) -> RecordInput:
     block = data_point["steps"]
     start, end = _interval_bounds(block)
-    # Live payload uses "count"; earlier drafts assumed "stepCount" — accept both.
-    count = block.get("count") or block.get("stepCount") or "0"
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=start,
         endDate=end,
         type=str(ActivityMetric.STEPS),
-        value=str(count),
+        value=str(block["count"]),
         unit="count",
     )
 
 
-def map_total_calories(data_point: dict[str, Any]) -> RecordInput:
-    block = data_point["totalCalories"]
+def map_active_energy_burned(data_point: dict[str, Any]) -> RecordInput:
+    """Basal-excluded energy over an Interval (Fitbit "activity calories").
+
+    Live-calibrated 2026-08-07: per-minute intervals with a ``kcal`` number.
+    This is Google's own active series, matching Apple ActiveEnergyBurned
+    semantics — confirmed by the official Fitbit→Google migration table
+    ("activity-only burn, excluding basal rate",
+    https://developers.google.com/health — data type mappings). It replaced
+    reconstructing active energy as ``total-calories − estimated basal``,
+    which a week of side-by-side daily rollups showed overestimating by
+    ~430–800 kcal/day.
+    """
+    block = data_point["activeEnergyBurned"]
     start, end = _interval_bounds(block)
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=start,
         endDate=end,
         type=str(ActivityMetric.ACTIVE_CALORIES),
-        value=str(block.get("caloriesKcal", "0")),
+        value=str(block["kcal"]),
         unit="kcal",
     )
 
@@ -247,7 +250,7 @@ def map_heart_rate(data_point: dict[str, Any]) -> RecordInput:
         startDate=instant,
         endDate=instant,
         type=HK_HEART_RATE,
-        value=str(block.get("beatsPerMinute", "0")),
+        value=str(block["beatsPerMinute"]),
         unit="count/min",
     )
 
@@ -255,11 +258,7 @@ def map_heart_rate(data_point: dict[str, Any]) -> RecordInput:
 def map_weight(data_point: dict[str, Any]) -> RecordInput:
     block = data_point["weight"]
     instant = _sample_instant(block)
-    # Live payload uses weightGrams (integer); accept weightKg for back-compat.
-    if "weightGrams" in block:
-        weight_kg = float(block["weightGrams"]) / 1000.0
-    else:
-        weight_kg = float(block.get("weightKg", 0))
+    weight_kg = float(block["weightGrams"]) / 1000.0
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=instant,
@@ -277,16 +276,11 @@ def map_distance(data_point: dict[str, Any]) -> RecordInput:
     (string), matching the discovery doc's ``Distance`` schema. The
     ``distanceMillimeters`` spelling only exists in ``MetricsSummary``
     (exercise summaries) — reading it here silently stored "0.0" for every
-    native-path point. Old spellings kept as fallbacks.
+    native-path point.
     """
     block = data_point["distance"]
     start, end = _interval_bounds(block)
-    distance_mm = float(
-        block.get("millimeters")
-        or block.get("distanceMillimeters")
-        or block.get("distanceMillimiters")
-        or 0
-    )
+    distance_mm = float(block["millimeters"])
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=start,
@@ -303,14 +297,10 @@ def map_altitude(data_point: dict[str, Any]) -> RecordInput:
     Discovery doc's ``Altitude`` schema says ``gainMillimeters`` (string).
     Not yet live-verified — no altimeter device on the calibration account —
     but the discovery doc has matched every live-verified shape to date.
-    ``elevationGainMillimeters`` was borrowed from ``MetricsSummary``
-    (exercise summaries) and kept only as a fallback.
     """
     block = data_point["altitude"]
     start, end = _interval_bounds(block)
-    altitude_mm = float(
-        block.get("gainMillimeters") or block.get("elevationGainMillimeters") or 0
-    )
+    altitude_mm = float(block["gainMillimeters"])
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=start,
@@ -325,8 +315,7 @@ def map_floors(data_point: dict[str, Any]) -> RecordInput:
     """Floors climbed over an Interval.
 
     Discovery doc's ``Floors`` schema says ``count`` (string). Not yet
-    live-verified (no altimeter device on the calibration account); the
-    guessed ``floorsClimbed`` kept only as a fallback.
+    live-verified (no altimeter device on the calibration account).
     """
     block = data_point["floors"]
     start, end = _interval_bounds(block)
@@ -335,7 +324,7 @@ def map_floors(data_point: dict[str, Any]) -> RecordInput:
         startDate=start,
         endDate=end,
         type=HK_FLIGHTS_CLIMBED,
-        value=str(block.get("count") or block.get("floorsClimbed") or "0"),
+        value=str(block["count"]),
         unit="count",
     )
 
@@ -356,7 +345,7 @@ def map_active_zone_minutes(data_point: dict[str, Any]) -> RecordInput:
         startDate=start,
         endDate=end,
         type=HK_ACTIVE_ZONE_MINUTES,
-        value=str(block.get("activeZoneMinutes") or block.get("minutes") or "0"),
+        value=str(block["activeZoneMinutes"]),
         unit="min",
     )
 
@@ -375,7 +364,7 @@ def map_daily_resting_heart_rate(data_point: dict[str, Any]) -> RecordInput:
         startDate=start,
         endDate=end,
         type=HK_RESTING_HEART_RATE,
-        value=str(block.get("beatsPerMinute", "0")),
+        value=str(block["beatsPerMinute"]),
         unit="count/min",
     )
 
@@ -393,7 +382,7 @@ def map_daily_oxygen_saturation(data_point: dict[str, Any]) -> RecordInput:
         startDate=start,
         endDate=end,
         type=HK_OXYGEN_SATURATION,
-        value=str(block.get("averagePercentage") or block.get("percentage") or "0"),
+        value=str(block["averagePercentage"]),
         unit="%",
     )
 
@@ -407,7 +396,7 @@ def map_body_fat(data_point: dict[str, Any]) -> RecordInput:
         startDate=instant,
         endDate=instant,
         type=HK_BODY_FAT_PERCENTAGE,
-        value=str(block.get("percentage", "0")),
+        value=str(block["percentage"]),
         unit="%",
     )
 
@@ -416,11 +405,7 @@ def map_height(data_point: dict[str, Any]) -> RecordInput:
     """Height Sample (point in time). Live payload reports millimeters."""
     block = data_point["height"]
     instant = _sample_instant(block)
-    # Live payload: heightMillimeters as string. Older drafts assumed heightMeters/heightM.
-    if "heightMillimeters" in block:
-        height_m = float(block["heightMillimeters"]) / 1000.0
-    else:
-        height_m = float(block.get("heightMeters") or block.get("heightM") or 0)
+    height_m = float(block["heightMillimeters"]) / 1000.0
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=instant,
@@ -434,22 +419,18 @@ def map_height(data_point: dict[str, Any]) -> RecordInput:
 def map_sleep_session(data_point: dict[str, Any]) -> list[RecordInput]:
     """Decompose a Google sleep session into one Record per stage interval.
 
-    Live payload puts stage bounds on the stage object directly
-    (``stages[].startTime`` / ``stages[].endTime``); earlier guesses assumed a
-    nested ``interval`` block. We accept both. Stage label is ``stages[].type``.
+    Live payload puts stage bounds flat on the stage object
+    (``stages[].startTime`` / ``stages[].endTime``); the label is
+    ``stages[].type``. Unknown labels are skipped (mapping coverage, not a
+    payload error).
     """
     block = data_point["sleep"]
     common = _common_record_fields(data_point)
     records: list[RecordInput] = []
     for stage in block.get("stages") or []:
-        # Accept either flat (live) or nested (earlier-guessed) time shape.
-        if "startTime" in stage and "endTime" in stage:
-            start = _parse_dt(stage["startTime"])
-            end = _parse_dt(stage["endTime"])
-        else:
-            start, end = _interval_bounds(stage)
-        label = stage.get("type") or stage.get("stage", "")
-        mapped = _SLEEP_STAGE_MAP.get(str(label).upper())
+        start = _parse_dt(stage["startTime"])
+        end = _parse_dt(stage["endTime"])
+        mapped = _SLEEP_STAGE_MAP.get(str(stage["type"]).upper())
         if mapped is None:
             continue
         records.append(
@@ -495,7 +476,7 @@ def map_exercise(data_point: dict[str, Any]) -> WorkoutInput:
         sourceName=SOURCE_NAME,
         durationUnit="s",
         duration=duration_seconds,
-        workoutActivityType=str(block.get("exerciseType", "UNKNOWN")),
+        workoutActivityType=str(block["exerciseType"]),
         caloriesBurned=float(metrics["caloriesKcal"])
         if "caloriesKcal" in metrics
         else None,
@@ -511,7 +492,7 @@ def map_exercise(data_point: dict[str, Any]) -> WorkoutInput:
 
 _RECORD_MAPPERS: dict[str, Callable[[dict[str, Any]], list[RecordInput]]] = {
     DATA_TYPE_STEPS: lambda dp: [map_steps(dp)],
-    DATA_TYPE_TOTAL_CALORIES: lambda dp: [map_total_calories(dp)],
+    DATA_TYPE_ACTIVE_ENERGY_BURNED: lambda dp: [map_active_energy_burned(dp)],
     DATA_TYPE_HEART_RATE: lambda dp: [map_heart_rate(dp)],
     DATA_TYPE_WEIGHT: lambda dp: [map_weight(dp)],
     DATA_TYPE_SLEEP: map_sleep_session,
@@ -529,10 +510,7 @@ _RECORD_MAPPERS: dict[str, Callable[[dict[str, Any]], list[RecordInput]]] = {
 # They're absent from DEFAULT_DATA_TYPES (so the default native-resolution sync
 # skips them) but become available when the caller passes
 # ``resolution_minutes=N`` to :func:`sync_user`.
-ROLLUP_ONLY_DATA_TYPES: tuple[str, ...] = (
-    DATA_TYPE_TOTAL_CALORIES,
-    DATA_TYPE_FLOORS,
-)
+ROLLUP_ONLY_DATA_TYPES: tuple[str, ...] = (DATA_TYPE_FLOORS,)
 
 # Types that don't support the rollUp endpoint at all (Sessions, point-in-time
 # Samples without an aggregation, pre-aggregated Daily summaries). When a
@@ -565,7 +543,7 @@ def _rollup_value(
         DATA_TYPE_WEIGHT: "weight",
         DATA_TYPE_BODY_FAT: "bodyFat",
         DATA_TYPE_ALTITUDE: "altitude",
-        DATA_TYPE_TOTAL_CALORIES: "totalCalories",
+        DATA_TYPE_ACTIVE_ENERGY_BURNED: "activeEnergyBurned",
         DATA_TYPE_FLOORS: "floors",
         DATA_TYPE_ACTIVE_ZONE_MINUTES: "activeZoneMinutes",
     }.get(data_type, key)
@@ -586,7 +564,7 @@ def _rollup_value(
         return str(float(block["weightGramsAvg"]) / 1000.0), "kg"
     if data_type == DATA_TYPE_BODY_FAT and "bodyFatPercentageAvg" in block:
         return str(block["bodyFatPercentageAvg"]), "%"
-    if data_type == DATA_TYPE_TOTAL_CALORIES and "kcalSum" in block:
+    if data_type == DATA_TYPE_ACTIVE_ENERGY_BURNED and "kcalSum" in block:
         return str(block["kcalSum"]), "kcal"
     if data_type == DATA_TYPE_ACTIVE_ZONE_MINUTES:
         # Sum across all heart-rate zones for a single "active zone minutes" value.
@@ -620,7 +598,7 @@ def _rollup_to_record(data_type: str, point: dict[str, Any]) -> RecordInput | No
         DATA_TYPE_WEIGHT: HK_BODY_MASS,
         DATA_TYPE_BODY_FAT: HK_BODY_FAT_PERCENTAGE,
         DATA_TYPE_ALTITUDE: HK_ALTITUDE_GAIN,
-        DATA_TYPE_TOTAL_CALORIES: str(ActivityMetric.ACTIVE_CALORIES),
+        DATA_TYPE_ACTIVE_ENERGY_BURNED: str(ActivityMetric.ACTIVE_CALORIES),
         DATA_TYPE_FLOORS: HK_FLIGHTS_CLIMBED,
         DATA_TYPE_ACTIVE_ZONE_MINUTES: HK_ACTIVE_ZONE_MINUTES,
     }[data_type]
@@ -639,6 +617,7 @@ def _rollup_to_record(data_type: str, point: dict[str, Any]) -> RecordInput | No
 
 DEFAULT_DATA_TYPES: tuple[str, ...] = (
     DATA_TYPE_STEPS,
+    DATA_TYPE_ACTIVE_ENERGY_BURNED,
     DATA_TYPE_HEART_RATE,
     DATA_TYPE_WEIGHT,
     DATA_TYPE_HEIGHT,
@@ -720,58 +699,10 @@ def _build_filter(data_type: str, start: datetime, end: datetime) -> str | None:
 
 _BASAL_RESULT_KEY = "basal-calories"
 
-
-def _profile_dob_and_gender(profile: dict[str, Any]) -> tuple[date | None, str]:
-    """Best-effort extraction of DOB + gender from Google Health profile payload.
-
-    Google's profile schema isn't fully documented; we try the most common
-    spellings. Returns ``(None, "")`` when either field can't be resolved —
-    callers fall back to the median-table BMR via :func:`get_bmr`.
-    """
-    dob_raw = (
-        profile.get("dateOfBirth")
-        or profile.get("birthday")
-        or profile.get("birthDate")
-    )
-    dob: date | None = None
-    if isinstance(dob_raw, str):
-        try:
-            dob = dateutil.parser.parse(dob_raw).date()
-        except (ValueError, TypeError):
-            dob = None
-    elif isinstance(dob_raw, dict):
-        # Google sometimes uses civil-date {"year": ..., "month": ..., "day": ...}.
-        try:
-            dob = date(int(dob_raw["year"]), int(dob_raw["month"]), int(dob_raw["day"]))
-        except (KeyError, TypeError, ValueError):
-            dob = None
-
-    gender_raw = str(profile.get("gender") or profile.get("sex") or "").upper()
-    if gender_raw.startswith("M"):
-        gender = "M"
-    elif gender_raw.startswith("F"):
-        gender = "F"
-    else:
-        gender = ""
-
-    return dob, gender
-
-
-def _latest_value_at_or_before(customer: Any, hk_type: str, day: date) -> float | None:
-    cutoff = datetime.combine(
-        day + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
-    )
-    record = (
-        Record.objects.filter(customer=customer, type=hk_type, startDate__lt=cutoff)
-        .order_by("-startDate")
-        .first()
-    )
-    if record is None:
-        return None
-    try:
-        return float(record.value)
-    except (TypeError, ValueError):
-        return None
+# Queried rollup-only as an input to compute_basal_calories; deliberately not a
+# public DATA_TYPE_* — totals include basal burn and are never ingested (storing
+# them under an ACTIVE identifier was the pre-0.9.0 stopgap this replaced).
+_TOTAL_CALORIES = "total-calories"
 
 
 def compute_basal_calories(
@@ -779,84 +710,83 @@ def compute_basal_calories(
     *,
     start: datetime,
     end: datetime,
-    profile: dict[str, Any] | None = None,
     client: GoogleHealthClient | None = None,
     admin_create_date: datetime | None = None,
 ) -> int:
-    """Estimate daily BMR for every day in [start, end] and persist as
-    ``ActivityMetric.BASAL_CALORIES`` records.
+    """Derive daily ``BASAL_CALORIES`` as total-calories − active-energy-burned.
 
-    Uses Mifflin-St Jeor (:func:`healthdatamodel.bmr.calculate_bmr`) when
-    height + weight are both available on or before each day, falling back to
-    the median-table lookup (:func:`healthdatamodel.bmr.get_bmr`) when either
-    is missing.
+    Google keeps its own energy ledger: ``total-calories`` (everything burned)
+    minus ``active-energy-burned`` (the basal-excluded series this library
+    ingests as ACTIVE) leaves the day's non-active burn — real per-user data,
+    measured by the same device that produced the other series.
 
-    Pass ``profile`` to skip the HTTP call (handy in tests). If both
-    ``profile`` and ``client`` are ``None``, a transient ``GoogleHealthClient``
-    is built for the profile fetch only.
+    This replaced the pre-0.9.0 profile-based Mifflin/median estimate: the
+    live profile payload carries ``age`` only (no gender, DOB, or height —
+    issue #29), so that path always emitted a flat 2000 kcal default. For
+    profile-supplied BMR math, use ``healthdatamodel.bmr`` directly.
+
+    Google does define a true BMR series (``basal-energy-burned``, mapped
+    from Fitbit's ``caloriesBMR`` per the official migration table), but as
+    of 2026-08-07 it supports only ``list``/``reconcile`` (no rollups) and
+    returns zero points for Fitbit accounts. If it ever populates, prefer it
+    over this derivation.
+
+    Days are 86400s rollup windows anchored at ``start``'s UTC midnight. A day
+    with no total-calories window is skipped, not defaulted (device not yet
+    synced); a missing active window counts as 0 (a fully sedentary day).
     """
-    owns_client = False
-    if profile is None:
-        owns_client = client is None
-        if client is None:
-            client = GoogleHealthClient(connection)
-        try:
-            profile = client.get_profile()
-        finally:
-            if owns_client:
-                client.close()
+    owns_client = client is None
+    if client is None:
+        client = GoogleHealthClient(connection)
 
-    dob, gender = _profile_dob_and_gender(profile or {})
-    age = age_from_dob(dob) if dob is not None else None
+    window_start = datetime.combine(
+        start.date(), datetime.min.time(), tzinfo=timezone.utc
+    )
+    window_end = datetime.combine(
+        end.date() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
+    )
 
-    customer = connection.customer
+    def _daily_kcal(
+        data_type: str, block_key: str
+    ) -> dict[datetime, tuple[float, datetime]]:
+        days: dict[datetime, tuple[float, datetime]] = {}
+        for point in client.iter_roll_up(
+            data_type, start=window_start, end=window_end, window_seconds=86400
+        ):
+            block = point.get(block_key)
+            if not isinstance(block, dict) or "kcalSum" not in block:
+                continue
+            p_start = _parse_dt(point["startTime"])
+            days[p_start] = (float(block["kcalSum"]), _parse_dt(point["endTime"]))
+        return days
+
+    try:
+        totals = _daily_kcal(_TOTAL_CALORIES, "totalCalories")
+        actives = _daily_kcal(DATA_TYPE_ACTIVE_ENERGY_BURNED, "activeEnergyBurned")
+    finally:
+        if owns_client:
+            client.close()
+
     creation = admin_create_date or datetime.now(timezone.utc)
     records: list[RecordInput] = []
-    day = start.date()
-    end_day = end.date()
-    while day <= end_day:
-        weight = _latest_value_at_or_before(customer, HK_BODY_MASS, day)
-        height_m = _latest_value_at_or_before(customer, HK_HEIGHT, day)
-
-        if weight is not None and height_m is not None and age is not None and gender:
-            bmr = calculate_bmr(age, gender, weight, height_m * 100.0)
-        else:
-            bmr = get_bmr(age=age, gender=gender)
-
-        day_start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
-        day_end = day_start + timedelta(days=1)
+    for day_start in sorted(totals):
+        total, day_end = totals[day_start]
+        active = actives.get(day_start, (0.0, day_end))[0]
         records.append(
             RecordInput(
-                recordId=f"basal-{day.isoformat()}",
+                recordId=f"basal-{day_start.date().isoformat()}",
                 startDate=day_start,
                 endDate=day_end,
                 creationDate=creation,
                 sourceName=SOURCE_NAME,
                 type=str(ActivityMetric.BASAL_CALORIES),
-                value=str(bmr),
+                value=f"{max(total - active, 0.0):.3f}",
                 unit="kcal",
             )
         )
-        day += timedelta(days=1)
 
-    ingest_records(customer, records, source=DataSource.GOOGLE_HEALTH)
+    ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
     return len(records)
-
-
-def _totals_to_active_energy(
-    records: list[RecordInput], basal_rate: float
-) -> list[RecordInput]:
-    """Convert total-calories windows to active energy, in place.
-
-    Each window's pro-rata share of ``basal_rate`` (kcal/day) is subtracted
-    and the result floored at 0, matching Apple/HealthKit ActiveEnergyBurned
-    semantics (a fully sedentary window is 0 active kcal, not its BMR share).
-    """
-    for rec in records:
-        seconds = (rec.endDate - rec.startDate).total_seconds()
-        active = max(0.0, float(rec.value) - basal_rate * seconds / 86400.0)
-        rec.value = f"{active:.3f}"
-    return records
 
 
 def _sync_one_data_type(
@@ -867,7 +797,6 @@ def _sync_one_data_type(
     start: datetime,
     end: datetime,
     resolution_minutes: int | None,
-    basal_rate: float | None,
     result: SyncResult,
 ) -> list[RecordInput]:
     """Fetch, map and ingest a single data type.
@@ -896,8 +825,6 @@ def _sync_one_data_type(
             for rec in (_rollup_to_record(data_type, p) for p in rollup_points)
             if rec is not None
         ]
-        if data_type == DATA_TYPE_TOTAL_CALORIES and basal_rate is not None:
-            records = _totals_to_active_energy(records, basal_rate)
         ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
         result.counts[data_type] = len(records)
         return records
@@ -965,7 +892,6 @@ def sync_user(
     resolution_minutes: int | None = None,
     client: GoogleHealthClient | None = None,
     compute_basal: bool = True,
-    basal_rate: float | None = None,
     collect_records: bool = False,
 ) -> SyncResult:
     """Fetch + ingest all configured data types for ``connection`` over [start, end].
@@ -975,16 +901,14 @@ def sync_user(
     after the main ingest so a daily ``BASAL_CALORIES`` series is available
     for downstream MET calculations.
 
-    ``basal_rate`` (kcal/day): when set, ``total-calories`` rollup windows are
-    converted to ACTIVE energy before ingest — each window's pro-rata basal
-    share is subtracted and the result floored at 0. Rationale: the API's only
-    energy series is ``total-calories`` (all candidate active/basal type names
-    were probed and rejected on 2026-07-30), but the stored record type is
-    ``HKQuantityTypeIdentifierActiveEnergyBurned``, whose Apple/HealthKit
-    semantics — and the rewards engine's MET math built on them — require
-    basal-EXCLUDED energy. Left unset, raw totals are stored and a sedentary
-    interval scores MET≈2 downstream. Callers should pass their best estimate
-    of the customer's daily basal rate.
+    Active energy comes straight from Google's ``active-energy-burned`` series
+    (in :data:`DEFAULT_DATA_TYPES`), which is already basal-excluded per
+    Apple/HealthKit ActiveEnergyBurned semantics. Earlier releases (< 0.9.0)
+    reconstructed it as ``total-calories`` rollups minus a caller-supplied
+    ``basal_rate``; that parameter — and total-calories ingestion entirely —
+    were removed once Google shipped the real series (live 2026-08-07), since
+    a week of side-by-side daily rollups showed the reconstruction
+    overestimating active energy by ~430–800 kcal/day.
 
     Failure isolation: one data type failing (bad filter, schema drift, a
     transient error on one endpoint) does not abort the others — the failure
@@ -995,8 +919,7 @@ def sync_user(
     :attr:`~googlehealth.models.ConnectionStatus.UNLINKED` (the account has no
     Google Health profile — permanent until the user reconnects with the right
     one). ``compute_basal_calories`` is likewise treated as an enrichment: its
-    failure (e.g. a token minted without the profile scope → HTTP 403) is
-    recorded, not raised.
+    failure is recorded, not raised.
 
     ``collect_records=True`` additionally returns the mapped Records on
     ``SyncResult.records``, so callers can compute derived stats from the
@@ -1015,8 +938,8 @@ def sync_user(
       rollup window becomes one Record. Data types that don't support
       rollUp (sleep, exercise, height, daily-*) fall back to native.
 
-    With a resolution set, ``total-calories`` and ``floors`` become usable
-    (the ``list`` endpoint rejects them; ``rollUp`` is their only option).
+    With a resolution set, ``floors`` becomes usable (the ``list`` endpoint
+    rejects it; ``rollUp`` is its only option).
     """
     if resolution_minutes is not None and resolution_minutes <= 0:
         raise ValueError("resolution_minutes must be positive or None")
@@ -1043,7 +966,6 @@ def sync_user(
                     start=start,
                     end=end,
                     resolution_minutes=resolution_minutes,
-                    basal_rate=basal_rate,
                     result=result,
                 )
                 if collect_records:
@@ -1085,11 +1007,8 @@ def sync_user(
                 result.errors[data_type] = f"{type(exc).__name__}: {exc}"
 
         if compute_basal and connection.status != ConnectionStatus.UNLINKED:
-            # Computed AFTER the main loop so the latest weight/height records
-            # this sync brought in are picked up by _latest_value_at_or_before.
-            # An enrichment, not a prerequisite: a failure here (e.g. a token
-            # minted without the profile scope → 403) must not discard an
-            # otherwise-complete sync.
+            # An enrichment, not a prerequisite: a failure here must not
+            # discard an otherwise-complete sync.
             try:
                 basal_count = compute_basal_calories(
                     connection, start=start, end=end, client=client

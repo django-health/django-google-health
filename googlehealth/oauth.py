@@ -484,7 +484,10 @@ def _fetch_google_user_id(access_token: str) -> str:
             f"users.getIdentity returned HTTP {response.status_code}: {response.text}"
         )
     payload = response.json()
-    user_id = payload.get("googleUserId") or payload.get("healthUserId")
+    # Live payload (verified 2026-08-07): {"name", "legacyUserId", "healthUserId"}.
+    # healthUserId is what webhook notifications route by; googleUserId does
+    # not exist despite the older docs' naming.
+    user_id = payload.get("healthUserId")
     if not user_id:
         raise OAuthError(f"users.getIdentity returned no user id: {payload!r}")
     return str(user_id)

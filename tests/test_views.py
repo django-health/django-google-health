@@ -67,7 +67,7 @@ def test_callback_exchanges_code_and_persists_connection(client, customer):
         },
     )
     respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/identity").mock(
-        return_value=Response(200, json={"googleUserId": "callback-user"})
+        return_value=Response(200, json={"healthUserId": "callback-user"})
     )
 
     response = client.get(f"/google-health/callback/?code=abc&state={state}")
