@@ -774,6 +774,10 @@ def _rollup_url(data_type: str) -> str:
     )
 
 
+def _daily_rollup_url(data_type: str) -> str:
+    return f"{API_BASE_URL}/{API_VERSION}/users/me/dataTypes/{data_type}/dataPoints:dailyRollUp"
+
+
 @respx.mock
 def test_sync_user_with_resolution_uses_rollup_endpoint(connection):
     """resolution_minutes=15 → rollUp path; mappers translate the
@@ -847,24 +851,30 @@ def test_sync_user_resolution_expands_to_rollup_only_types(connection):
     """When data_types is None + resolution_minutes is set, floors joins the
     default sweep (the list endpoint rejects it)."""
 
-    # Mock every data type's rollup endpoint as empty; only assert that
-    # floors was queried at all.
+    # Mock every data type's daily-rollup endpoint as empty (1440 routes
+    # through dailyRollUp); only assert that floors was queried at all.
     for dt in ingest.DEFAULT_DATA_TYPES:
         if dt in ingest._ROLLUP_UNSUPPORTED_DATA_TYPES:
             respx.get(_dp_url(dt)).mock(return_value=Response(200, json=_page([])))
         else:
-            respx.post(_rollup_url(dt)).mock(
+            respx.post(_daily_rollup_url(dt)).mock(
                 return_value=Response(200, json={"rollupDataPoints": []})
             )
     for dt in ingest.ROLLUP_ONLY_DATA_TYPES:
-        respx.post(_rollup_url(dt)).mock(
+        respx.post(_daily_rollup_url(dt)).mock(
             return_value=Response(
                 200,
                 json={
                     "rollupDataPoints": [
                         {
-                            "startTime": "2026-05-01T00:00:00Z",
-                            "endTime": "2026-05-02T00:00:00Z",
+                            "civilStartTime": {
+                                "date": {"year": 2026, "month": 5, "day": 1},
+                                "time": {},
+                            },
+                            "civilEndTime": {
+                                "date": {"year": 2026, "month": 5, "day": 2},
+                                "time": {},
+                            },
                             "floors": {"countSum": "12"},
                         }
                     ],
@@ -1395,3 +1405,74 @@ def test_sync_user_other_api_errors_do_not_unlink(connection):
     assert DATA_TYPE_STEPS in result.errors
     connection.refresh_from_db()
     assert connection.status == ConnectionStatus.ACTIVE
+
+
+# dailyRollUp routing (#4) ----------------------------------------------------
+
+
+@respx.mock
+def test_sync_user_daily_resolution_routes_through_daily_rollup(connection, customer):
+    """resolution_minutes=1440 uses dailyRollUp (civil-day aligned, request
+    shape verified live 2026-08-07); records span the civil day as UTC days."""
+    daily_route = respx.post(_daily_rollup_url(DATA_TYPE_STEPS)).mock(
+        return_value=Response(
+            200,
+            json={
+                "rollupDataPoints": [
+                    {
+                        "civilStartTime": {
+                            "date": {"year": 2026, "month": 5, "day": 1},
+                            "time": {},
+                        },
+                        "civilEndTime": {
+                            "date": {"year": 2026, "month": 5, "day": 2},
+                            "time": {},
+                        },
+                        "steps": {"countSum": "8123"},
+                    }
+                ],
+                "nextPageToken": "",
+            },
+        )
+    )
+    rollup_route = respx.post(_rollup_url(DATA_TYPE_STEPS)).mock(
+        return_value=Response(200, json={"rollupDataPoints": []})
+    )
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_STEPS],
+        resolution_minutes=1440,
+        compute_basal=False,
+    )
+
+    assert daily_route.called
+    assert not rollup_route.called
+    body = json.loads(daily_route.calls.last.request.content)
+    assert body["range"]["start"] == {"date": {"year": 2026, "month": 5, "day": 1}}
+    assert body["range"]["end"] == {"date": {"year": 2026, "month": 5, "day": 2}}
+    assert body["windowSizeDays"] == 1
+
+    assert result.counts[DATA_TYPE_STEPS] == 1
+    rec = Record.objects.get(customer=customer, type=str(ActivityMetric.STEPS))
+    assert rec.value == "8123"
+    assert rec.startDate == datetime(2026, 5, 1, tzinfo=timezone.utc)
+    assert rec.endDate == datetime(2026, 5, 2, tzinfo=timezone.utc)
+
+
+@respx.mock
+def test_sync_user_sub_daily_resolution_still_uses_rollup(connection):
+    rollup_route = respx.post(_rollup_url(DATA_TYPE_STEPS)).mock(
+        return_value=Response(200, json={"rollupDataPoints": []})
+    )
+    ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_STEPS],
+        resolution_minutes=60,
+        compute_basal=False,
+    )
+    assert rollup_route.called

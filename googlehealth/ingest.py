@@ -580,6 +580,22 @@ def _rollup_value(
     return None
 
 
+# Map each rollup-capable data type to the same HK identifier its native
+# (list-path) mapper uses, so downstream queries see one consistent type per
+# metric.
+_ROLLUP_RECORD_TYPES: dict[str, str] = {
+    DATA_TYPE_STEPS: str(ActivityMetric.STEPS),
+    DATA_TYPE_DISTANCE: HK_DISTANCE_WALKING_RUNNING,
+    DATA_TYPE_HEART_RATE: HK_HEART_RATE,
+    DATA_TYPE_WEIGHT: HK_BODY_MASS,
+    DATA_TYPE_BODY_FAT: HK_BODY_FAT_PERCENTAGE,
+    DATA_TYPE_ALTITUDE: HK_ALTITUDE_GAIN,
+    DATA_TYPE_ACTIVE_ENERGY_BURNED: str(ActivityMetric.ACTIVE_CALORIES),
+    DATA_TYPE_FLOORS: HK_FLIGHTS_CLIMBED,
+    DATA_TYPE_ACTIVE_ZONE_MINUTES: HK_ACTIVE_ZONE_MINUTES,
+}
+
+
 def _rollup_to_record(data_type: str, point: dict[str, Any]) -> RecordInput | None:
     """Convert one ``rollupDataPoint`` to a :class:`RecordInput`."""
     valued = _rollup_value(point, data_type)
@@ -589,19 +605,36 @@ def _rollup_to_record(data_type: str, point: dict[str, Any]) -> RecordInput | No
     start = _parse_dt(point["startTime"])
     end = _parse_dt(point["endTime"])
 
-    # Map to the same HK identifier the native (list-path) mapper uses, so
-    # downstream queries see one consistent type per metric.
-    record_type = {
-        DATA_TYPE_STEPS: str(ActivityMetric.STEPS),
-        DATA_TYPE_DISTANCE: HK_DISTANCE_WALKING_RUNNING,
-        DATA_TYPE_HEART_RATE: HK_HEART_RATE,
-        DATA_TYPE_WEIGHT: HK_BODY_MASS,
-        DATA_TYPE_BODY_FAT: HK_BODY_FAT_PERCENTAGE,
-        DATA_TYPE_ALTITUDE: HK_ALTITUDE_GAIN,
-        DATA_TYPE_ACTIVE_ENERGY_BURNED: str(ActivityMetric.ACTIVE_CALORIES),
-        DATA_TYPE_FLOORS: HK_FLIGHTS_CLIMBED,
-        DATA_TYPE_ACTIVE_ZONE_MINUTES: HK_ACTIVE_ZONE_MINUTES,
-    }[data_type]
+    return RecordInput(
+        recordId=None,
+        startDate=start,
+        endDate=end,
+        creationDate=start,
+        sourceName=SOURCE_NAME,
+        type=_ROLLUP_RECORD_TYPES[data_type],
+        value=value,
+        unit=unit,
+    )
+
+
+def _daily_rollup_to_record(
+    data_type: str, point: dict[str, Any]
+) -> RecordInput | None:
+    """Convert one civil-day ``rollupDataPoint`` (dailyRollUp) to a Record.
+
+    dailyRollUp points carry ``civilStartTime`` / ``civilEndTime``
+    (``{date: {...}, time: {}}``) instead of ``startTime`` / ``endTime``;
+    value blocks are the same ``*RollupValue`` schemas as rollUp (verified
+    live 2026-08-07). Civil dates are spanned as UTC days — the same
+    convention as :func:`_civil_day_bounds` for the pre-aggregated daily-*
+    types, since the payload carries no offset.
+    """
+    valued = _rollup_value(point, data_type)
+    if valued is None:
+        return None
+    value, unit = valued
+    start = _civil_day_bounds(point["civilStartTime"])[0]
+    end = _civil_day_bounds(point["civilEndTime"])[0]
 
     return RecordInput(
         recordId=None,
@@ -609,7 +642,7 @@ def _rollup_to_record(data_type: str, point: dict[str, Any]) -> RecordInput | No
         endDate=end,
         creationDate=start,
         sourceName=SOURCE_NAME,
-        type=record_type,
+        type=_ROLLUP_RECORD_TYPES[data_type],
         value=value,
         unit=unit,
     )
@@ -811,18 +844,26 @@ def _sync_one_data_type(
     )
 
     if use_rollup:
-        window_seconds = resolution_minutes * 60
-        rollup_points = list(
-            client.iter_roll_up(
+        if resolution_minutes == 1440:
+            # Daily resolution routes through dailyRollUp: aggregation aligned
+            # to the user's civil days (Google resolves the timezone), not to
+            # 86400s windows anchored at whatever timestamp `start` happens
+            # to be.
+            rollup_points = client.iter_daily_roll_up(
+                data_type, start_date=start.date(), end_date=end.date()
+            )
+            converter = _daily_rollup_to_record
+        else:
+            rollup_points = client.iter_roll_up(
                 data_type,
                 start=start,
                 end=end,
-                window_seconds=window_seconds,
+                window_seconds=resolution_minutes * 60,
             )
-        )
+            converter = _rollup_to_record
         records = [
             rec
-            for rec in (_rollup_to_record(data_type, p) for p in rollup_points)
+            for rec in (converter(data_type, p) for p in rollup_points)
             if rec is not None
         ]
         ingest_records(connection.customer, records, source=DataSource.GOOGLE_HEALTH)
@@ -934,9 +975,13 @@ def sync_user(
       per-stage records; exercise → Workout.
 
     * positive int — aggregate via the ``rollUp`` endpoint with
-      ``windowSize={N*60}s`` (so ``1440`` gives one record per day). Each
-      rollup window becomes one Record. Data types that don't support
-      rollUp (sleep, exercise, height, daily-*) fall back to native.
+      ``windowSize={N*60}s``. Each rollup window becomes one Record. Data
+      types that don't support rollUp (sleep, exercise, height, daily-*)
+      use the native path instead.
+
+    * ``1440`` exactly — aggregate via ``dailyRollUp``: one record per
+      **civil day** in the user's timezone (Google resolves it), rather
+      than 86400s windows anchored to ``start``.
 
     With a resolution set, ``floors`` becomes usable (the ``list`` endpoint
     rejects it; ``rollUp`` is its only option).

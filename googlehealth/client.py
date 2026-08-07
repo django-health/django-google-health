@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterator, Mapping
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -258,6 +258,54 @@ class GoogleHealthClient:
             body["pageSize"] = page_size
         while True:
             page = self.roll_up(data_type, body)
+            yield from page.get("rollupDataPoints", [])
+            page_token = page.get("nextPageToken") or None
+            if not page_token:
+                return
+            body = {**body, "pageToken": page_token}
+
+    def iter_daily_roll_up(
+        self,
+        data_type: str,
+        *,
+        start_date: date,
+        end_date: date,
+        window_size_days: int = 1,
+        page_size: int | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Iterate civil-day-aligned ``rollupDataPoints`` across pages.
+
+        Unlike :meth:`iter_roll_up` (whose windows are anchored to whatever
+        timestamp the caller passes), ``dailyRollUp`` aggregates on the user's
+        civil days — Google resolves the timezone. The range is inclusive of
+        both dates. Yielded points carry ``civilStartTime`` / ``civilEndTime``
+        (a ``{date: {...}, time: {...}}`` pair) instead of ``startTime`` /
+        ``endTime``; the value blocks use the same ``*RollupValue`` schemas.
+        Request/response shapes verified live 2026-08-07.
+        """
+        body: dict[str, Any] = {
+            "range": {
+                "start": {
+                    "date": {
+                        "year": start_date.year,
+                        "month": start_date.month,
+                        "day": start_date.day,
+                    }
+                },
+                "end": {
+                    "date": {
+                        "year": end_date.year,
+                        "month": end_date.month,
+                        "day": end_date.day,
+                    }
+                },
+            },
+            "windowSizeDays": window_size_days,
+        }
+        if page_size is not None:
+            body["pageSize"] = page_size
+        while True:
+            page = self.daily_roll_up(data_type, body)
             yield from page.get("rollupDataPoints", [])
             page_token = page.get("nextPageToken") or None
             if not page_token:
