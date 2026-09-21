@@ -36,6 +36,9 @@ from django.core.exceptions import ImproperlyConfigured
 from django.utils import timezone
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
+from healthdatamodel.constants import ConnectionStatus as WearableConnectionStatus
+from healthdatamodel.constants import DataSource
+from healthdatamodel.models import WearableConnection
 from pydantic import ValidationError
 
 from .constants import (
@@ -352,6 +355,28 @@ def ingest_tokens(
             )
             google_user_id = ""
 
+    # migrated_from is provenance, set once and never overwritten: reuse the
+    # existing value on a reconnect (update_or_create's defaults would
+    # otherwise clobber it every call), and only compute it fresh for a
+    # brand-new row.
+    existing_migrated_from = (
+        GoogleHealthConnection.objects.filter(customer=customer)
+        .values_list("migrated_from", flat=True)
+        .first()
+    )
+    if existing_migrated_from is not None:
+        migrated_from = existing_migrated_from
+    else:
+        migrated_from = (
+            DataSource.FITBIT
+            if WearableConnection.objects.filter(
+                customer=customer,
+                data_source=DataSource.FITBIT,
+                status=WearableConnectionStatus.ACTIVE,
+            ).exists()
+            else ""
+        )
+
     connection, _ = GoogleHealthConnection.objects.update_or_create(
         customer=customer,
         defaults={
@@ -362,6 +387,7 @@ def ingest_tokens(
             "token_expires_at": parsed.expires_at(now=now),
             "scopes": parsed.scopes,
             "status": status,
+            "migrated_from": migrated_from,
         },
     )
     return connection
