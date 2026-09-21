@@ -41,7 +41,9 @@ from healthdatamodel.schemas import MetadataEntry, RecordInput, WorkoutInput
 from .client import GoogleHealthAPIError, GoogleHealthClient
 from .constants import (
     DATA_TYPE_ACTIVE_ENERGY_BURNED,
+    DATA_TYPE_ACTIVE_MINUTES,
     DATA_TYPE_ACTIVE_ZONE_MINUTES,
+    DATA_TYPE_ACTIVITY_LEVEL,
     DATA_TYPE_ALTITUDE,
     DATA_TYPE_BODY_FAT,
     DATA_TYPE_DAILY_OXYGEN_SATURATION,
@@ -50,11 +52,16 @@ from .constants import (
     DATA_TYPE_EXERCISE,
     DATA_TYPE_FLOORS,
     DATA_TYPE_HEART_RATE,
+    DATA_TYPE_HEART_RATE_VARIABILITY,
     DATA_TYPE_HEIGHT,
+    DATA_TYPE_OXYGEN_SATURATION,
     DATA_TYPE_SLEEP,
     DATA_TYPE_STEPS,
     DATA_TYPE_WEIGHT,
     ERROR_REASON_ACCOUNT_NOT_LINKED,
+    SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    SCOPE_HEALTH_METRICS_AND_MEASUREMENTS_READONLY,
+    SCOPE_SLEEP_READONLY,
     SOURCE_NAME,
 )
 from .models import ConnectionStatus
@@ -663,6 +670,83 @@ DEFAULT_DATA_TYPES: tuple[str, ...] = (
     DATA_TYPE_DAILY_OXYGEN_SATURATION,
     DATA_TYPE_BODY_FAT,
 )
+
+# Which of Google's three readonly scopes gates each data type we know about
+# (including types this library doesn't map/ingest yet — a caller can still
+# pass them via ``data_types``). Mirrors Google's own scope groupings, not
+# something the API exposes for us to introspect.
+_SCOPE_FOR_DATA_TYPE: dict[str, str] = {
+    DATA_TYPE_STEPS: SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    DATA_TYPE_ACTIVE_ENERGY_BURNED: SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    DATA_TYPE_ACTIVE_MINUTES: SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    DATA_TYPE_ACTIVE_ZONE_MINUTES: SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    DATA_TYPE_ACTIVITY_LEVEL: SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    DATA_TYPE_DISTANCE: SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    DATA_TYPE_ALTITUDE: SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    DATA_TYPE_FLOORS: SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    DATA_TYPE_EXERCISE: SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    DATA_TYPE_HEART_RATE: SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    DATA_TYPE_HEART_RATE_VARIABILITY: SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    DATA_TYPE_DAILY_RESTING_HEART_RATE: SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    DATA_TYPE_SLEEP: SCOPE_SLEEP_READONLY,
+    DATA_TYPE_WEIGHT: SCOPE_HEALTH_METRICS_AND_MEASUREMENTS_READONLY,
+    DATA_TYPE_HEIGHT: SCOPE_HEALTH_METRICS_AND_MEASUREMENTS_READONLY,
+    DATA_TYPE_BODY_FAT: SCOPE_HEALTH_METRICS_AND_MEASUREMENTS_READONLY,
+    DATA_TYPE_OXYGEN_SATURATION: SCOPE_HEALTH_METRICS_AND_MEASUREMENTS_READONLY,
+    DATA_TYPE_DAILY_OXYGEN_SATURATION: SCOPE_HEALTH_METRICS_AND_MEASUREMENTS_READONLY,
+}
+
+
+def scope_filtered_data_types(
+    connection: GoogleHealthConnection, data_types: list[str] | None = None
+) -> list[str]:
+    """Resolve the requested data types down to what ``connection.scopes`` allows.
+
+    ``data_types=None`` means "the package default set", so it's expanded here
+    (mirroring :func:`sync_user`'s own default-plus-rollup-only expansion)
+    before filtering — otherwise every caller of this helper would have to
+    know that detail. A data type absent from :data:`_SCOPE_FOR_DATA_TYPE` is
+    passed through unfiltered rather than dropped, so a future data type
+    added to the package without a mapping update here fails open (reactive
+    403 handling in :func:`sync_user` still applies) instead of silently
+    never syncing.
+
+    Intended as defense-in-depth alongside that reactive 403 handling: a
+    connection's ``scopes`` bookkeeping is set once at OAuth time and is the
+    only local signal callers have of what the live token can actually
+    return, so this skips a request entirely when it says the scope isn't
+    there instead of relying solely on Google's API to say no.
+    """
+    if data_types is None:
+        requested = list(DEFAULT_DATA_TYPES) + [
+            dt for dt in ROLLUP_ONLY_DATA_TYPES if dt not in DEFAULT_DATA_TYPES
+        ]
+    else:
+        requested = list(data_types)
+    granted = set(connection.scopes or [])
+    if not granted:
+        # An empty list is bookkeeping we can't trust, not proof of zero
+        # grants: Google's token response may legally omit ``scope`` (RFC
+        # 6749 §5.1) when the grant matches what was requested, which
+        # persists [] here even for a fully-granted connection. Fail open —
+        # keep relying on sync_user's reactive 403 handling — rather than
+        # going permanently and silently dark on a field that can be blank
+        # for reasons unrelated to what the user actually granted.
+        return requested
+    allowed = [
+        dt
+        for dt in requested
+        if dt not in _SCOPE_FOR_DATA_TYPE or _SCOPE_FOR_DATA_TYPE[dt] in granted
+    ]
+    skipped = [dt for dt in requested if dt not in allowed]
+    if skipped:
+        logger.info(
+            "googlehealth sync: skipping %s for connection %s — required "
+            "scope not granted",
+            skipped,
+            connection.pk,
+        )
+    return allowed
 
 
 def _civil(ts: datetime) -> str:

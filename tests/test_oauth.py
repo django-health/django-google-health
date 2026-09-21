@@ -5,6 +5,9 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 import responses
 import respx
+from healthdatamodel.constants import ConnectionStatus as WearableConnectionStatus
+from healthdatamodel.constants import DataSource
+from healthdatamodel.models import WearableConnection
 from httpx import Response
 
 from googlehealth import oauth
@@ -122,6 +125,66 @@ def test_ingest_tokens_updates_existing_connection(customer, connection):
     assert updated.pk == connection.pk
     assert updated.access_token == "ya29.rotated"
     assert GoogleHealthConnection.objects.count() == 1
+
+
+def test_ingest_tokens_records_migrated_from_fitbit_on_first_connect(customer):
+    """An active Fitbit WearableConnection at connect time is recorded as
+    provenance — a one-time snapshot, not a live status."""
+    WearableConnection.objects.create(
+        customer=customer,
+        data_source=DataSource.FITBIT,
+        status=WearableConnectionStatus.ACTIVE,
+    )
+    tokens = GoogleTokens(
+        access_token="ya29.x", expires_in=3600, refresh_token="1//y", scope=SCOPES[0]
+    )
+
+    conn = oauth.ingest_tokens(customer=customer, tokens=tokens, google_user_id="gid-1")
+
+    assert conn.migrated_from == DataSource.FITBIT
+
+
+def test_ingest_tokens_leaves_migrated_from_blank_without_prior_fitbit(customer):
+    tokens = GoogleTokens(
+        access_token="ya29.x", expires_in=3600, refresh_token="1//y", scope=SCOPES[0]
+    )
+
+    conn = oauth.ingest_tokens(customer=customer, tokens=tokens, google_user_id="gid-1")
+
+    assert conn.migrated_from == ""
+
+
+def test_ingest_tokens_does_not_overwrite_migrated_from_on_reconnect(customer):
+    """migrated_from is set once at creation and must survive a later
+    reconnect even if the Fitbit connection has since been deleted —
+    update_or_create's defaults must not clobber it on every call."""
+    WearableConnection.objects.create(
+        customer=customer,
+        data_source=DataSource.FITBIT,
+        status=WearableConnectionStatus.ACTIVE,
+    )
+    first_tokens = GoogleTokens(
+        access_token="ya29.x", expires_in=3600, refresh_token="1//y", scope=SCOPES[0]
+    )
+    conn = oauth.ingest_tokens(
+        customer=customer, tokens=first_tokens, google_user_id="gid-1"
+    )
+    assert conn.migrated_from == DataSource.FITBIT
+
+    WearableConnection.objects.filter(customer=customer).delete()
+    second_tokens = GoogleTokens(
+        access_token="ya29.rotated",
+        expires_in=3600,
+        refresh_token="1//rotated",
+        scope=SCOPES[0],
+    )
+
+    reconnected = oauth.ingest_tokens(
+        customer=customer, tokens=second_tokens, google_user_id="gid-1"
+    )
+
+    assert reconnected.pk == conn.pk
+    assert reconnected.migrated_from == DataSource.FITBIT
 
 
 @respx.mock

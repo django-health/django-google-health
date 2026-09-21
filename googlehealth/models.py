@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from django.conf import settings
 from django.db import models, transaction
 from django.utils import timezone as dj_timezone
+from healthdatamodel.constants import DataSource
 
 
 class ConnectionStatus(models.TextChoices):
@@ -42,6 +43,14 @@ class GoogleHealthConnection(models.Model):
         max_length=32,
         choices=ConnectionStatus.choices,
         default=ConnectionStatus.ACTIVE,
+    )
+    # Provenance only — set once when the row is first created (see
+    # oauth.ingest_tokens), never updated afterwards. Answers "how did this
+    # connection come to exist", not "is the customer currently migrated";
+    # that's a live join across this model and WearableConnection and is
+    # deliberately not cached here (see the QAAM migration dashboard).
+    migrated_from = models.CharField(
+        max_length=100, choices=DataSource.choices, blank=True, default=""
     )
     connected_at = models.DateTimeField(auto_now_add=True)
     last_sync_at = models.DateTimeField(null=True, blank=True)
