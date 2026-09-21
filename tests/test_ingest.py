@@ -28,6 +28,7 @@ from googlehealth.constants import (
     DATA_TYPE_WEIGHT,
     OAUTH_TOKEN_URL,
     SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    SCOPE_SLEEP_READONLY,
     SOURCE_NAME,
 )
 from googlehealth.models import GoogleHealthConnection
@@ -346,6 +347,114 @@ def test_default_data_types_includes_all_mapped_types():
         DATA_TYPE_BODY_FAT,
     } <= set(ingest.DEFAULT_DATA_TYPES)
     assert DATA_TYPE_FLOORS in ingest.ROLLUP_ONLY_DATA_TYPES
+
+
+# scope_filtered_data_types ---------------------------------------------------
+
+
+def test_scope_filtered_data_types_drops_types_missing_their_scope(customer):
+    """Only the activity scope is granted: sleep must be dropped from the
+    default sweep up front, not left to a reactive 403 from Google."""
+    from googlehealth.constants import SCOPE_ACTIVITY_AND_FITNESS_READONLY
+
+    connection = GoogleHealthConnection.objects.create(
+        customer=customer,
+        google_user_id="scope-test-1",
+        access_token="ya29.access",
+        refresh_token="1//refresh",
+        token_expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        scopes=[SCOPE_ACTIVITY_AND_FITNESS_READONLY],
+    )
+
+    allowed = ingest.scope_filtered_data_types(connection)
+
+    assert DATA_TYPE_SLEEP not in allowed
+    assert DATA_TYPE_WEIGHT not in allowed  # health_metrics scope not granted
+    assert DATA_TYPE_STEPS in allowed
+
+
+def test_scope_filtered_data_types_keeps_sleep_when_only_sleep_scope_granted(
+    customer,
+):
+    """Only the sleep scope is granted: activity types drop, sleep stays."""
+    connection = GoogleHealthConnection.objects.create(
+        customer=customer,
+        google_user_id="scope-test-2",
+        access_token="ya29.access",
+        refresh_token="1//refresh",
+        token_expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        scopes=[SCOPE_SLEEP_READONLY],
+    )
+
+    allowed = ingest.scope_filtered_data_types(connection)
+
+    assert DATA_TYPE_SLEEP in allowed
+    assert DATA_TYPE_STEPS not in allowed
+    assert DATA_TYPE_ACTIVE_ENERGY_BURNED not in allowed
+
+
+def test_scope_filtered_data_types_empty_scopes_fails_open(customer):
+    """An empty ``scopes`` list isn't proof nothing was granted — Google's
+    token response may omit ``scope`` even on a full grant (RFC 6749 §5.1).
+    Must fail open to the full requested set, not go silently dark."""
+    connection = GoogleHealthConnection.objects.create(
+        customer=customer,
+        google_user_id="scope-test-3",
+        access_token="ya29.access",
+        refresh_token="1//refresh",
+        token_expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        scopes=[],
+    )
+
+    allowed = ingest.scope_filtered_data_types(connection)
+
+    # data_types=None expands to DEFAULT_DATA_TYPES + rollup-only types
+    # (mirroring sync_user), so the fail-open set includes floors too.
+    assert set(allowed) == set(ingest.DEFAULT_DATA_TYPES) | set(
+        ingest.ROLLUP_ONLY_DATA_TYPES
+    )
+
+
+def test_scope_filtered_data_types_expands_default_with_rollup_only_types(
+    customer,
+):
+    """``data_types=None`` mirrors sync_user's own expansion: the default set
+    plus rollup-only types (e.g. floors), not just DEFAULT_DATA_TYPES."""
+    from googlehealth.constants import ALL_READ_SCOPES, DATA_TYPE_FLOORS
+
+    connection = GoogleHealthConnection.objects.create(
+        customer=customer,
+        google_user_id="scope-test-4",
+        access_token="ya29.access",
+        refresh_token="1//refresh",
+        token_expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        scopes=list(ALL_READ_SCOPES),
+    )
+
+    allowed = ingest.scope_filtered_data_types(connection)
+
+    assert DATA_TYPE_FLOORS in allowed
+    assert set(ingest.DEFAULT_DATA_TYPES) <= set(allowed)
+
+
+def test_scope_filtered_data_types_respects_explicit_data_types_argument(
+    customer,
+):
+    """An explicit ``data_types`` list is filtered as-is, not expanded."""
+    connection = GoogleHealthConnection.objects.create(
+        customer=customer,
+        google_user_id="scope-test-5",
+        access_token="ya29.access",
+        refresh_token="1//refresh",
+        token_expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        scopes=[SCOPE_ACTIVITY_AND_FITNESS_READONLY],
+    )
+
+    allowed = ingest.scope_filtered_data_types(
+        connection, data_types=[DATA_TYPE_STEPS, DATA_TYPE_SLEEP]
+    )
+
+    assert allowed == [DATA_TYPE_STEPS]
 
 
 def test_map_exercise():
