@@ -36,7 +36,6 @@ from django.core.exceptions import ImproperlyConfigured
 from django.utils import timezone
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
-from healthdatamodel.constants import ConnectionStatus as WearableConnectionStatus
 from healthdatamodel.constants import DataSource
 from healthdatamodel.models import WearableConnection
 from pydantic import ValidationError
@@ -367,12 +366,13 @@ def ingest_tokens(
     if existing_migrated_from is not None:
         migrated_from = existing_migrated_from
     else:
+        # Any status counts: a customer who already disconnected Fitbit
+        # before adding Google Health was still migrating from Fitbit.
         migrated_from = (
             DataSource.FITBIT
             if WearableConnection.objects.filter(
                 customer=customer,
                 data_source=DataSource.FITBIT,
-                status=WearableConnectionStatus.ACTIVE,
             ).exists()
             else ""
         )

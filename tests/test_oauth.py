@@ -144,6 +144,27 @@ def test_ingest_tokens_records_migrated_from_fitbit_on_first_connect(customer):
     assert conn.migrated_from == DataSource.FITBIT
 
 
+def test_ingest_tokens_records_migrated_from_fitbit_when_already_disconnected(
+    customer,
+):
+    """A Fitbit WearableConnection that was disconnected before the customer
+    ever added Google Health is still valid migration provenance — the
+    common real-world sequence is disconnect old wearable, then connect
+    new one."""
+    WearableConnection.objects.create(
+        customer=customer,
+        data_source=DataSource.FITBIT,
+        status=WearableConnectionStatus.DISCONNECTED,
+    )
+    tokens = GoogleTokens(
+        access_token="ya29.x", expires_in=3600, refresh_token="1//y", scope=SCOPES[0]
+    )
+
+    conn = oauth.ingest_tokens(customer=customer, tokens=tokens, google_user_id="gid-1")
+
+    assert conn.migrated_from == DataSource.FITBIT
+
+
 def test_ingest_tokens_leaves_migrated_from_blank_without_prior_fitbit(customer):
     tokens = GoogleTokens(
         access_token="ya29.x", expires_in=3600, refresh_token="1//y", scope=SCOPES[0]
