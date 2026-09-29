@@ -35,7 +35,7 @@ The model uses `settings.AUTH_USER_MODEL` so it works with any custom user model
 ## Configuration
 
 ```python
-GOOGLE_HEALTH_CLIENT_ID = "..."        # from Google Cloud Console
+GOOGLE_HEALTH_CLIENT_ID = "..."  # from Google Cloud Console
 GOOGLE_HEALTH_CLIENT_SECRET = "..."
 GOOGLE_HEALTH_REDIRECT_URI = "https://your-app.example.com/google-health/callback"
 ```
@@ -70,11 +70,15 @@ session is needed:
 Related settings (all optional):
 
 ```python
-GOOGLE_HEALTH_APP_DEEPLINK = "yourapp://google-health"  # default deep link; must be an app-scheme absolute URI
-GOOGLE_HEALTH_ALLOWED_DEEPLINK_SCHEMES = ["yourapp"]    # restrict accepted schemes (default: any non-web scheme)
-GOOGLE_HEALTH_MOBILE_STATE_TTL_MINUTES = 10             # state row time-to-live
-GOOGLE_HEALTH_HTTP_TIMEOUT = 10.0                       # seconds, all outbound OAuth calls
-GOOGLE_HEALTH_DEFAULT_SCOPES = [...]                    # shared with the session flow
+GOOGLE_HEALTH_APP_DEEPLINK = (
+    "yourapp://google-health"  # default deep link; must be an app-scheme absolute URI
+)
+GOOGLE_HEALTH_ALLOWED_DEEPLINK_SCHEMES = [
+    "yourapp"
+]  # restrict accepted schemes (default: any non-web scheme)
+GOOGLE_HEALTH_MOBILE_STATE_TTL_MINUTES = 10  # state row time-to-live
+GOOGLE_HEALTH_HTTP_TIMEOUT = 10.0  # seconds, all outbound OAuth calls
+GOOGLE_HEALTH_DEFAULT_SCOPES = [...]  # shared with the session flow
 ```
 
 Deep links are validated by `oauth.validate_deeplink`: an absolute URI with a

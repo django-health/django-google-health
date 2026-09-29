@@ -17,9 +17,11 @@ a mapper looks wrong:
 
    ```python
    import os, django, httpx
+
    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "demo.settings")
    django.setup()
    from googlehealth.models import GoogleHealthConnection
+
    conn = GoogleHealthConnection.objects.first()
    hdr = {"Authorization": f"Bearer {conn.access_token}"}
    # then make whatever GET/POST you need against health.googleapis.com
